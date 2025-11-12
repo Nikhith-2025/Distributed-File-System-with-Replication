@@ -21,10 +21,42 @@
 #define STOP_PACKET "\n--STOP--\n"
 
 #define NM_IP "127.0.0.1"
-#define NM_REGISTER_PORT 8000
+#define NM_REGISTER_PORT 8001
 
 static FILE* log_fp;
 static pthread_mutex_t log_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+// logging function
+void server_log(const char* level, const char* fmt, ...){
+
+    pthread_mutex_lock(&log_mutex);
+    
+    time_t now = time(NULL);
+    char time_buf[100];
+    strftime(time_buf, sizeof(time_buf), "%Y-%m-%d %H:%M%S", localtime(&now));
+
+    char log_msg[2048];
+    va_list args;
+    va_start(args, fmt);
+    vsnprintf(log_msg, sizeof(log_msg), fmt, args);
+    va_end(args);
+
+    unsigned long thread_id = (unsigned long)pthread_self();
+
+    printf("[%s] [%s] (Thread %lu) %s\n", time_buf, level, thread_id, log_msg);
+
+    if (log_fp) {
+
+        fprintf(log_fp, "[%s] [%s] (Thread %lu) %s\n", time_buf, level, thread_id, log_msg);
+        fflush(log_fp);
+    }
+
+    pthread_mutex_unlock(&log_mutex);
+}
+
+#define LOG_INFO(...) server_log("INFO", __VA_ARGS__)
+#define LOG_WARN(...) server_log("WARN", __VA_ARGS__)
+#define LOG_ERROR(...) server_log("ERROR", __VA_ARGS__)
 
 typedef struct Filelock {
 
@@ -34,12 +66,42 @@ typedef struct Filelock {
     struct Filelock* next;
 } Filelock;
 
-typedef struct stringnode{
+typedef struct Stringnode{
     char* str;
-    struct stringnode* next;
+    struct Stringnode* next;
 }Stringnode;
 
+char* read_file_to_string(const char* file_path){
 
+    FILE* fp = fopen(file_path, "r");
+    if(!fp){
+
+        // if file doesnt exist
+        if(errno == ENOENT){
+            return strdup("");
+        }
+        LOG_ERROR("read_file_to_string: Failed to open %s: %s", file_path, strerror(errno));
+        return NULL;
+    }
+
+    fseek(fp, 0, SEEK_END);
+    long file_size = ftell(fp);
+    fseek(fp, 0, SEEK_SET);
+
+    char* buffer = (char*)malloc(file_size+1);
+    if (!buffer) {
+
+        LOG_ERROR("read_file_to_string: Failed to allocate memory");
+        fclose(fp);
+        return NULL;
+    }
+
+    size_t read_size = fread(buffer, 1, file_size, fp);
+    buffer[read_size] = '\0';
+    fclose(fp);
+
+    return buffer;
+}
 
 Stringnode* get_node_at(Stringnode* head, int index) {
 
@@ -60,42 +122,181 @@ void free_list(Stringnode* head) {
     }
 }
 
+int get_list_count(Stringnode* head){
+
+    int count = 0;
+    while(head){
+
+        count++;
+        head = head->next;
+    }
+    return count;
+}
+
+void insert_node_at(Stringnode** head_ref, int index, const char* data){
+
+    Stringnode* new_node = (Stringnode*)malloc(sizeof(Stringnode));
+    new_node->str = strdup(data);
+
+    if(index == 0){
+
+        new_node->next = *head_ref;
+        *head_ref = new_node;
+        return;
+    }
+
+    Stringnode* prev = get_node_at(*head_ref, index - 1);
+    if (prev == NULL) {
+
+        new_node->next = NULL;
+        *head_ref = new_node; 
+    } 
+    
+    else {
+        new_node->next = prev->next;
+        prev->next = new_node;
+    }
+}
+
+char* rebuild_string_from_list(Stringnode* head, const char* join_char) {
+
+    size_t total_len = 1;
+    size_t join_len = strlen(join_char);
+    Stringnode* current = head;
+
+    while (current) {
+
+        total_len += strlen(current->str);
+        if (current->next) {
+            total_len += join_len;
+        }
+        current = current->next;
+    }
+
+    char* result = (char*)malloc(total_len);
+    if (!result) return NULL;
+    result[0] = '\0';
+
+    current = head;
+    while (current) {
+
+        strcat(result, current->str);
+        if (current->next) {
+            strcat(result, join_char);
+        }
+        current = current->next;
+    }
+    return result;
+}
+
+Stringnode* parse_file_to_sentences(const char* content) {
+
+    Stringnode* head = NULL;
+    Stringnode* tail = NULL;
+    
+    const char* start = content;
+    const char* p = content;
+
+    while (*p) {
+       
+        if (*p == '.' || *p == '!' || *p == '?') {
+
+            size_t len = (p - start) + 1; 
+            char* sentence = (char*)malloc(len + 1);
+            strncpy(sentence, start, len);
+            sentence[len] = '\0';
+
+            Stringnode* new_node = (Stringnode*)malloc(sizeof(Stringnode));
+            new_node->str = sentence;
+            new_node->next = NULL;
+
+            if (tail) {
+                tail->next = new_node;
+            } 
+            
+            else {
+                head = new_node;
+            }
+            tail = new_node;
+
+            start = p + 1;
+        }
+        p++;
+    }
+
+    if (start < p) {
+
+        size_t len = p - start;
+        if (len > 0) {
+
+            char* sentence = (char*)malloc(len + 1);
+            strncpy(sentence, start, len);
+            sentence[len] = '\0';
+            
+            Stringnode* new_node = (Stringnode*)malloc(sizeof(Stringnode));
+            new_node->str = sentence;
+            new_node->next = NULL;
+
+            if (tail) {
+                tail->next = new_node;
+            } 
+            
+            else {
+                head = new_node;
+            }
+        }
+    }
+    return head;
+}
+
+Stringnode* parse_sentence_to_words(const char* sentence) {
+
+    Stringnode* head = NULL;
+    Stringnode* tail = NULL;
+    
+    const char* start = sentence;
+    const char* p = sentence;
+
+    while (1) {
+       
+        while (*p && *p != ' ') {
+            p++;
+        }
+
+        size_t len = p - start;
+        if (len > 0) {
+
+            char* word = (char*)malloc(len + 1);
+            strncpy(word, start, len);
+            word[len] = '\0';
+            
+            Stringnode* new_node = (Stringnode*)malloc(sizeof(Stringnode));
+            new_node->str = word;
+            new_node->next = NULL;
+
+            if (tail) {
+                tail->next = new_node;
+            } 
+            
+            else {
+                head = new_node;
+            }
+            tail = new_node;
+        }
+
+        if (*p == '\0') {
+            break; 
+        }
+        
+        p++;
+        start = p;
+    }
+    return head;
+}
+
 static Filelock* global_lock_list = NULL;
 
 static pthread_mutex_t lock_list_mutex = PTHREAD_MUTEX_INITIALIZER;
-
-// logging function
-void server_log(const char* level, const char* fmt, ...){
-    pthread_mutex_lock(&log_mutex);
-    
-    time_t now = time(NULL);
-    char time_buf[100];
-    strftime(time_buf, sizeof(time_buf), "%Y-%m-%d %H:%M%S", localtime(&now));
-
-    char log_msg[2048];
-    va_list args;
-    va_start(args, fmt);
-    vsnprintf(log_msg, sizeof(log_msg), fmt, args);
-    va_end(args);
-
-    unsigned long thread_id = (unsigned long)pthread_self();
-
-    //console
-    printf("[%s] [%s] (Thread %lu) %s\n", time_buf, level, thread_id, log_msg);
-
-    //file
-    if (log_fp) {
-
-        fprintf(log_fp, "[%s] [%s] (Thread %lu) %s\n", time_buf, level, thread_id, log_msg);
-        fflush(log_fp);
-    }
-
-    pthread_mutex_unlock(&log_mutex);
-}
-
-#define LOG_INFO(...) server_log("INFO", __VA_ARGS__)
-#define LOG_WARN(...) server_log("WARN", __VA_ARGS__)
-#define LOG_ERROR(...) server_log("ERROR", __VA_ARGS__)
 
 int scan_storage_directory(char* file_list_buffer, int buffer_size){
 
@@ -467,38 +668,47 @@ void* handle_client_connection(void* args) {
     connection_args_t* conn_args = (connection_args_t*)args;
     char client_ip[INET_ADDRSTRLEN];
     inet_ntop(AF_INET, &(conn_args->client_addr.sin_addr), client_ip, INET_ADDRSTRLEN);
+
+    pthread_t self_thread_id = pthread_self();
     
     LOG_INFO("Client connected from: %s:%d", client_ip, ntohs(conn_args->client_addr.sin_port));
     
-    char buffer[1024];
+    char buffer[2048];
     int bytes_read;
 
-    while((bytes_read = read(conn_args->client_sock, buffer, sizeof(buffer) - 1))){
+    while((bytes_read = read(conn_args->client_sock, buffer, sizeof(buffer) - 1)) > 0){
 
         buffer[bytes_read] = '\0';
-        buffer[strcspn(buffer, "r\n")] = 0;
+        buffer[strcspn(buffer, "\r\n")] = 0;
 
         LOG_INFO("Received Client command: %s", buffer);
 
         char* command;
         char* filename;
-        char buffer_copy[1024];
+        char buffer_copy[2048];
         strncpy(buffer_copy, buffer, sizeof(buffer_copy));
 
         command = strtok(buffer_copy, "|");
         filename = strtok(NULL, "|");
 
-        if (!command || !filename) {
+        if (!command) {
             
             LOG_WARN("Invalid command format from Client: %s", buffer);
-            send(conn_args->client_sock, "ERROR Invalid format\n", 20, 0);
+            send(conn_args->client_sock, "ERROR Invalid format\n", 21, 0);
             continue;
         }
 
         if (strcmp(command, "ETIRW") == 0) {
 
             LOG_WARN("Client sent ETIRW outside of a write session.");
-            send(conn_args->client_sock, "ERROR Not in write mode\n", 23, 0);
+            send(conn_args->client_sock, "ERROR Not in write mode\n", 24, 0);
+            continue;
+        }
+
+        if (!filename) {
+
+            LOG_WARN("Invalid command format from Client (no filename): %s", buffer);
+            send(conn_args->client_sock, "ERROR Invalid format\n", 21, 0);
             continue;
         }
 
@@ -509,14 +719,9 @@ void* handle_client_connection(void* args) {
         }
 
         char file_path[512];
+        char undo_path[512];
         snprintf(file_path, sizeof(file_path), "%s%s", STORAGE_DIR, filename);
-
-        FILE* fp = fopen(file_path, "r");
-        if(fp == NULL){
-            LOG_WARN("Client requested file not found: %s", file_path);
-            send(conn_args->client_sock, "ERROR File not found\n", 21, 0);
-            continue;
-        }
+        snprintf(undo_path, sizeof(undo_path), "%s%s.undo", STORAGE_DIR, filename);
 
         if (strcmp(command, "READ") == 0) {
 
@@ -600,12 +805,165 @@ void* handle_client_connection(void* args) {
 
         else if (strcmp(command, "WRITE") == 0) {
            
-            send(conn_args->client_sock, "ACK_WRITE OK\n", 13, 0);
-            LOG_INFO("WRITE command received (not yet implemented)");
+           char* s_index_str = strtok(NULL, "|");
+            if (!s_index_str) {
+
+                LOG_WARN("Invalid WRITE format: %s", buffer);
+                send(conn_args->client_sock, "ERROR Invalid format\n", 20, 0);
+                continue;
+            }
+            int sentence_index = atoi(s_index_str);
+
+            if (!acquire_lock(filename, sentence_index, self_thread_id)) {
+
+                send(conn_args->client_sock, "ERROR Sentence locked\n", 22, 0);
+                continue;
+            }
+
+            if (create_undo_backup(file_path, undo_path) != 0) {
+
+                LOG_ERROR("Failed to create undo backup for %s", filename);
+                release_lock(self_thread_id);
+                send(conn_args->client_sock, "ERROR Write failed (undo)\n", 26, 0);
+                continue;
+            }
+
+            char* file_content = read_file_to_string(file_path);
+            if (file_content == NULL) {
+
+                release_lock(self_thread_id);
+                send(conn_args->client_sock, "ERROR File read error\n", 21, 0);
+                continue;
+            }
             
-            // This is where we will enter the "write state"
-            // And then read the <word_index> <content> lines
-            // And finally ETIRW
+            Stringnode* sentences = parse_file_to_sentences(file_content);
+            free(file_content);
+
+            int sentence_count = get_list_count(sentences);
+            if (sentence_index < 0 || sentence_index > sentence_count ) {
+    
+                LOG_WARN("Invalid sentence index: %d (Count: %d)", sentence_index, sentence_count);
+                free_list(sentences);
+                release_lock(self_thread_id);
+                send(conn_args->client_sock, "ERROR Sentence index out of range\n", 34, 0);
+                continue;
+            }
+
+            LOG_INFO("Entering write state for %s[%d]", filename, sentence_index);
+            send(conn_args->client_sock, "ACK_WRITE OK\n", 13, 0);
+
+            char write_buffer[2048];
+            int write_bytes_read;
+            int write_loop_active = 1;
+
+            while (write_loop_active && (write_bytes_read = read(conn_args->client_sock, write_buffer, sizeof(write_buffer) - 1)) > 0)
+            {
+                write_buffer[write_bytes_read] = '\0';
+                write_buffer[strcspn(write_buffer, "\r\n")] = 0;
+                
+                LOG_INFO("Write state command: %s", write_buffer);
+                
+                char* write_cmd = strtok(write_buffer, "|");
+
+                if (write_cmd == NULL) {
+                    LOG_WARN("Invalid write state command");
+                    send(conn_args->client_sock, "ERROR Invalid write command\n", 28, 0);
+                    continue;
+                }
+
+                if (strcmp(write_cmd, "ETIRW") == 0) {
+                    
+                    char* new_content = rebuild_string_from_list(sentences, "");
+                    FILE* fp_out = fopen(file_path, "w");
+
+                    if (!fp_out) {
+
+                        LOG_ERROR("CRITICAL: Failed to open %s for final write", file_path);
+                        send(conn_args->client_sock, "ERROR Final write failed\n", 25, 0);
+                    } 
+                    
+                    else {
+
+                        fwrite(new_content, 1, strlen(new_content), fp_out);
+                        fclose(fp_out);
+                        LOG_INFO("Write successful for %s", filename);
+                        send(conn_args->client_sock, "WRITE_SUCCESS\n", 14, 0);
+                    }
+                    free(new_content);
+                    write_loop_active = 0;
+                } 
+
+                else { 
+
+                    char* w_index_str = write_cmd;
+                    char* content = strtok(NULL, "|"); 
+                    
+                    if (!w_index_str || !content) {
+                        LOG_WARN("Invalid write update format. Expected: <index>|<content>");
+                        send(conn_args->client_sock, "ERROR Invalid update format\n", 28, 0);
+                        continue;
+                    }
+                    
+                    int word_index = atoi(w_index_str);
+                    
+                    Stringnode* target_sentence = get_node_at(sentences, sentence_index);
+                    if (target_sentence == NULL) { 
+                      
+                        if (sentence_index == 0 && get_list_count(sentences) == 0) {
+                            insert_node_at(&sentences, 0, ""); 
+                            target_sentence = sentences;
+                        } 
+                        
+                        else {
+
+                             LOG_ERROR("CRITICAL: Lost target sentence node");
+                             send(conn_args->client_sock, "ERROR Internal write error\n", 27, 0);
+                             write_loop_active = 0; 
+                             continue;
+                        }
+                    }
+
+                    Stringnode* words = parse_sentence_to_words(target_sentence->str);
+                    int word_count = get_list_count(words);
+
+                    if (word_index < 0 || word_index > word_count) {
+
+                        LOG_WARN("Invalid word index: %d (Count: %d)", word_index, word_count);
+                        send(conn_args->client_sock, "ERROR Word index out of range\n", 30, 0);
+                        free_list(words);
+                        continue;
+                    }
+
+                    insert_node_at(&words, word_index, content);
+                    
+                    free(target_sentence->str);
+                    target_sentence->str = rebuild_string_from_list(words, " ");
+                    free_list(words);
+
+                    Stringnode* new_sentences = parse_file_to_sentences(target_sentence->str);
+                    
+                    free(target_sentence->str); 
+                    target_sentence->str = new_sentences->str; 
+                    
+                    Stringnode* last_new_node = new_sentences;
+                    while (last_new_node->next) { 
+                        last_new_node = last_new_node->next;
+                    }
+                    
+                    last_new_node->next = target_sentence->next;
+                    target_sentence->next = new_sentences->next;
+
+                    free(new_sentences); 
+                }
+            }
+
+            free_list(sentences);
+            release_lock(self_thread_id);
+            LOG_INFO("Exiting write state for %s", filename);
+
+            if (write_bytes_read <= 0) {
+                LOG_WARN("Client disconnected during write session for %s", filename);
+            }
         }
         
         else {
