@@ -5,23 +5,23 @@ LDFLAGS = -pthread
 NM_DIR = Name_server
 CLIENT_DIR = Client_user
 
-NM_SOURCES = $(NM_DIR)/listen.c \
-              $(NM_DIR)/nm_metadata.c \
-              $(NM_DIR)/commands.c
+NM_SOURCES = $(NM_DIR)/listen.c $(NM_DIR)/nm_metadata.c $(NM_DIR)/commands.c
 NM_OBJECTS = $(NM_SOURCES:.c=.o)
-NM_TARGET = nm_server
+NM_TARGET = name_server
 
 CLIENT_SOURCES = $(CLIENT_DIR)/client.c
 CLIENT_OBJECTS = $(CLIENT_SOURCES:.c=.o)
-CLIENT_TARGET = nm_client
+CLIENT_TARGET = client_user
 
 all: $(NM_TARGET) $(CLIENT_TARGET)
 
 $(NM_TARGET): $(NM_OBJECTS)
 	$(CC) $(LDFLAGS) -o $@ $^
 
+
 $(CLIENT_TARGET): $(CLIENT_OBJECTS)
 	$(CC) $(LDFLAGS) -o $@ $^
+
 
 %.o: %.c
 	$(CC) $(CFLAGS) -c $< -o $@

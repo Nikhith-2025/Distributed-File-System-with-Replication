@@ -1,29 +1,52 @@
-# Compiler
 CC = gcc
+CFLAGS = -Wall -Wextra -pthread -g
+LDFLAGS = -pthread
 
-# Compiler flags
-# -g: Adds debugging information
-# -Wall: Turns on all common warnings
-# -pthread: Links the POSIX threads library (CRITICAL!)
-CFLAGS = -g -Wall -pthread
+NM_CLIENT_DIR = name_client
+NM_DIR = $(NM_CLIENT_DIR)/Name_server
+CLIENT_DIR = $(NM_CLIENT_DIR)/Client_user
 
-# Executable name
-TARGET = storage_server
+NM_SOURCES = $(NM_DIR)/listen.c \
+             $(NM_DIR)/nm_metadata.c \
+             $(NM_DIR)/commands.c
+NM_OBJECTS = $(NM_SOURCES:.c=.o)
+NM_TARGET = name_server
 
-# Source file
-SRC = storageserver.c
+CLIENT_SOURCES = $(CLIENT_DIR)/client.c
+CLIENT_OBJECTS = $(CLIENT_SOURCES:.c=.o)
+CLIENT_TARGET = client_user
 
-# Default rule: builds the target
-all: $(TARGET)
+SS_SOURCE = storageserver.c
+SS_TARGET = storage_server
 
-$(TARGET): $(SRC)
-	$(CC) $(CFLAGS) -o $(TARGET) $(SRC)
+.PHONY: all clean help run-nm run-client run-ss
 
-# Rule to clean up build files
+all: $(NM_TARGET) $(CLIENT_TARGET) $(SS_TARGET)
+
+$(NM_TARGET): $(NM_OBJECTS)
+	$(CC) $(LDFLAGS) -o $@ $^
+
+$(CLIENT_TARGET): $(CLIENT_OBJECTS)
+	$(CC) $(LDFLAGS) -o $@ $^
+
+
+$(SS_TARGET): $(SS_SOURCE)
+	$(CC) $(CFLAGS) -o $@ $<
+
+%.o: %.c
+	$(CC) $(CFLAGS) -c $< -o $@
+
 clean:
-	rm -f $(TARGET)
-	rm -f *.o
+	rm -f $(NM_OBJECTS) $(CLIENT_OBJECTS)
+	rm -f $(NM_TARGET) $(CLIENT_TARGET) $(SS_TARGET)
+	rm -f *.o *.log
+	rm -rf nm_files storage
 
-# Rule to run the server
-run: $(TARGET)
-	./$(TARGET)
+run-nm: $(NM_TARGET)
+	./$(NM_TARGET)
+
+run-client: $(CLIENT_TARGET)
+	./$(CLIENT_TARGET)
+
+run-ss: $(SS_TARGET)
+	./$(SS_TARGET)
