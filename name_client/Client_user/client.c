@@ -138,10 +138,10 @@ int main()
             strncpy(cmd_copy, command, sizeof(cmd_copy));
             char *cmd_token = strtok(cmd_copy, " \t");
 
-            if (strcasecmp(cmd_token, "READ") == 0 || strcasecmp(cmd_token, "STREAM") == 0) 
+            if (strcasecmp(cmd_token, "READ") == 0)
             {
                 char ss_cmd[512];
-                snprintf(ss_cmd, sizeof(ss_cmd), "%s|%s\n", cmd_token, ss_filename);
+                snprintf(ss_cmd, sizeof(ss_cmd), "READ|%s\n", ss_filename);
                 send(ss_sock, ss_cmd, strlen(ss_cmd), 0);
                 
                 printf("\n");
@@ -167,6 +167,69 @@ int main()
                 printf("\n\n");
             }
 
+            else if (strcasecmp(cmd_token, "STREAM") == 0)
+            {
+                char ss_cmd[512];
+                snprintf(ss_cmd, sizeof(ss_cmd), "STREAM|%s\n", ss_filename);
+                send(ss_sock, ss_cmd, strlen(ss_cmd), 0);
+
+                char recv_buf[BUFFER_SIZE];
+                char partial[BUFFER_SIZE];
+                partial[0] = '\0';
+
+                printf("\n");
+
+                while (1)
+                {
+                    ssize_t n = recv(ss_sock, recv_buf, sizeof(recv_buf) - 1, 0);
+                    if (n <= 0) break;
+
+                    recv_buf[n] = '\0';
+
+                    char *stop_pos = strstr(recv_buf, "--STOP--");
+                    if (stop_pos) *stop_pos = '\0';
+
+                    // Combine any partial word from previous chunk with new data
+                    char combined[BUFFER_SIZE * 2];
+                    snprintf(combined, sizeof(combined), "%s%s", partial, recv_buf);
+
+                    char *saveptr;
+                    char *token = strtok_r(combined, " \t\r\n", &saveptr);
+                    partial[0] = '\0';
+
+                    while (token)
+                    {
+                        char *next = strtok_r(NULL, " \t\r\n", &saveptr);
+                        if (next == NULL && !stop_pos)
+                        {
+                            // Last token of this chunk and stream not finished yet:
+                            // store it as partial in case it is split across packets.
+                            strncpy(partial, token, sizeof(partial) - 1);
+                            partial[sizeof(partial) - 1] = '\0';
+                            break;
+                        }
+
+                        printf("%s ", token);
+                        fflush(stdout);
+                        usleep(100000); // 0.1 seconds between words
+                        token = next;
+                    }
+
+                    if (stop_pos)
+                    {
+                        // Flush any remaining partial word when stream ends
+                        if (partial[0] != '\0')
+                        {
+                            printf("%s ", partial);
+                            fflush(stdout);
+                        }
+                        break;
+                    }
+                }
+
+                printf("\n\n");
+            }
+
             else if (strcasecmp(cmd_token, "UNDO") == 0 || is_undo) 
             {
                 char ss_cmd[512];
@@ -186,10 +249,15 @@ int main()
             {
                 char write_cmd_copy[MAX_COMMAND];
                 strncpy(write_cmd_copy, command, sizeof(write_cmd_copy));
+                write_cmd_copy[sizeof(write_cmd_copy) - 1] = '\0';
+
+                char *token = strtok(write_cmd_copy, " \t"); // "WRITE"
+                (void)token;
+                char *ignored_filename = strtok(NULL, " \t");
+                (void)ignored_filename;
                 
-                strtok(write_cmd_copy, " \t"); 
-                char *w_sentence = strtok(NULL, " \t");
-                int sentence_num = w_sentence ? atoi(w_sentence) : 0;
+                char *sentence_token = strtok(NULL, " \t");
+                int sentence_num = sentence_token ? atoi(sentence_token) : 0;
 
                 char ss_cmd[512];
                 snprintf(ss_cmd, sizeof(ss_cmd), "WRITE|%s|%d\n", ss_filename, sentence_num);
