@@ -29,7 +29,6 @@ $(NM_TARGET): $(NM_OBJECTS)
 $(CLIENT_TARGET): $(CLIENT_OBJECTS)
 	$(CC) $(LDFLAGS) -o $@ $^
 
-
 $(SS_TARGET): $(SS_SOURCE)
 	$(CC) $(CFLAGS) -o $@ $<
 
@@ -41,6 +40,7 @@ clean:
 	rm -f $(NM_TARGET) $(CLIENT_TARGET) $(SS_TARGET)
 	rm -f *.o *.log
 	rm -rf nm_files storage
+	rm -rf storage storage_[0-9]*
 
 run-nm: $(NM_TARGET)
 	./$(NM_TARGET)
