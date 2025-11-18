@@ -13,8 +13,7 @@ void send_error(int sock, ErrorCode err)
     send_response(sock, get_error_message(err));
 }
 
-static int send_ss_command(StorageServerInfo *ss, const char *cmd,
-                           char *response, size_t resp_size)
+static int send_ss_command(StorageServerInfo *ss, const char *cmd, char *response, size_t resp_size)
 {
     if (!ss || !ss->active)
     {
@@ -88,7 +87,15 @@ void handle_command(int client_sock, const char *username, const char *command)
             return;
         }
 
-        StorageServerInfo *ss = get_available_storage_server();
+        int ss_index = find_least_loaded_ss();
+        if (ss_index == -1)
+        {
+            send_error(client_sock, ERR_NO_STORAGE_SERVERS);
+            return;
+        }
+        
+        StorageServerInfo *ss = get_storage_server(ss_index);
+
         if (!ss)
         {
             send_error(client_sock, ERR_NO_STORAGE_SERVERS);
@@ -106,6 +113,7 @@ void handle_command(int client_sock, const char *username, const char *command)
                 FileMetadata meta = {0};
                 strncpy(meta.filename, filename, MAX_FILENAME - 1);
                 strncpy(meta.owner, username, MAX_USERNAME - 1);
+
                 meta.ss_index = ss - nm_state.storage_servers;
                 meta.created_time = time(NULL);
                 meta.last_modified = time(NULL);
@@ -114,11 +122,30 @@ void handle_command(int client_sock, const char *username, const char *command)
 
                 insert_file(&nm_state.file_map, &meta);
 
+                increment_ss_file_count(meta.ss_index);
+
+                // track this new file on the chosen storage server so
+                // that load-based selection can work correctly.
+                pthread_mutex_lock(&nm_state.ss_lock);
+                if (meta.ss_index >= 0 && meta.ss_index < nm_state.storage_count)
+                {
+                    StorageServerInfo *tss = &nm_state.storage_servers[meta.ss_index];
+                    if (tss->file_count < MAX_FILES)
+                    {
+                        strncpy(tss->files[tss->file_count], filename, MAX_FILENAME - 1);
+                        tss->files[tss->file_count][MAX_FILENAME - 1] = '\0';
+                        tss->file_count++;
+                    }
+                }
+                pthread_mutex_unlock(&nm_state.ss_lock);
+
                 char resp[256];
                 snprintf(resp, sizeof(resp), "File '%s' created successfully!\n", filename);
                 send_response(client_sock, resp);
                 log_response(username, ERR_SUCCESS, filename);
+                persist_metadata();
             }
+
             else
             {
                 send_response(client_sock, "ERROR: Storage Server failed to create file\n");
@@ -190,6 +217,8 @@ void handle_command(int client_sock, const char *username, const char *command)
         file->last_accessed = time(NULL);
         strncpy(file->last_accessed_by, username, MAX_USERNAME - 1);
         log_response(username, ERR_SUCCESS, filename);
+        persist_metadata();
+        persist_metadata();
     }
 
     // ================= LIST =================
@@ -252,10 +281,33 @@ void handle_command(int client_sock, const char *username, const char *command)
             {
                 delete_file(&nm_state.file_map, filename);
 
+                // remove the file from the storage server's local list
+                // and decrement its file_count so future CREATEs can be
+                // balanced across servers.
+                pthread_mutex_lock(&nm_state.ss_lock);
+                if (file->ss_index >= 0 && file->ss_index < nm_state.storage_count)
+                {
+                    StorageServerInfo *tss = &nm_state.storage_servers[file->ss_index];
+                    for (int i = 0; i < tss->file_count; i++)
+                    {
+                        if (strcmp(tss->files[i], filename) == 0)
+                        {
+                            for (int j = i; j < tss->file_count - 1; j++)
+                            {
+                                strncpy(tss->files[j], tss->files[j + 1], MAX_FILENAME);
+                            }
+                            tss->file_count--;
+                            break;
+                        }
+                    }
+                }
+                pthread_mutex_unlock(&nm_state.ss_lock);
+
                 char resp[256];
                 snprintf(resp, sizeof(resp), "File '%s' deleted successfully!\n", filename);
                 send_response(client_sock, resp);
                 log_response(username, ERR_SUCCESS, filename);
+                persist_metadata();
             }
             else
             {
@@ -346,7 +398,14 @@ void handle_command(int client_sock, const char *username, const char *command)
                  ss->ip, ss->client_port, filename);
         send_response(client_sock, resp);
 
+        // Optimistically mark the file as modified; exact size/word/char
+        // counts will be refreshed on the next VIEW -l / INFO.
+        file->last_modified = time(NULL);
+        file->last_accessed = file->last_modified;
+        strncpy(file->last_accessed_by, username, MAX_USERNAME - 1);
+
         log_response(username, ERR_SUCCESS, filename);
+        persist_metadata();
     }
 
     // ================= STREAM =================
@@ -475,6 +534,9 @@ void handle_command(int client_sock, const char *username, const char *command)
 
         close(ss_sock);
 
+        trim_string(file_content);
+        content_len = strlen(file_content);
+
         if (content_len == 0)
         {
             send_response(client_sock, "No commands to execute.\n");
@@ -546,7 +608,13 @@ void handle_command(int client_sock, const char *username, const char *command)
                  ss->ip, ss->client_port, filename);
 
         send_response(client_sock, resp);
+
+        file->last_modified = time(NULL);
+        file->last_accessed = file->last_modified;
+        strncpy(file->last_accessed_by, username, MAX_USERNAME - 1);
+
         log_response(username, ERR_SUCCESS, filename);
+        persist_metadata();
     }
 
     // ================= INVALID COMMAND =================
@@ -568,15 +636,13 @@ void cmd_view(int client_sock, const char *username, int show_all, int show_deta
         return;
     }
 
-    char response[BUFFER_SIZE * 2];
+    char response[BUFFER_SIZE * 4];
     response[0] = '\0';
 
-    if (show_details)
-    {
-        strcat(response, "---------------------------------------------------------\n");
-        strcat(response, "|  Filename  | Words | Chars | Last Access Time | Owner |\n");
-        strcat(response, "|------------|-------|-------|------------------|-------|\n");
-    }
+    char content[BUFFER_SIZE * 3];
+    content[0] = '\0';
+    
+    int accessible_files = 0;
 
     for (int i = 0; i < count; i++)
     {
@@ -588,19 +654,27 @@ void cmd_view(int client_sock, const char *username, int show_all, int show_deta
             continue;
         }
 
+        accessible_files++;
+
         if (show_details)
         {
+
+            // Ensure metadata like size/word/char counts are up-to-date
+            // before displaying detailed information
+            if (refresh_file_metadata(file) != 0)
+            {
+                char warn_msg[512];
+                snprintf(warn_msg, sizeof(warn_msg), "Using cached metadata for %s", file->filename);
+                log_message("WARN", NULL, 0, username, warn_msg);
+            }
             char time_str[64];
             format_time(file->last_accessed, time_str, sizeof(time_str));
 
             char line[512];
-            snprintf(line, sizeof(line),
-                     "| %-10s | %5d | %5d | %16s | %-5s |\n",
-                     file->filename, file->word_count, file->char_count,
-                     time_str, file->owner);
-
-            strcat(response, line);
+            snprintf(line, sizeof(line), "| %-10s | %5d | %5d | %19s | %-5s |\n", file->filename, file->word_count, file->char_count, time_str, file->owner);
+            strcat(content, line);
         }
+
         else
         {
             char line[300];
@@ -609,12 +683,30 @@ void cmd_view(int client_sock, const char *username, int show_all, int show_deta
         }
     }
 
-    if (show_details)
+    if (accessible_files == 0)
     {
-        strcat(response, "---------------------------------------------------------\n");
+        send_response(client_sock, "No accessible files found.\n");
     }
 
-    send_response(client_sock, response);
+    else
+    {
+        if (show_details)
+        {
+            strcat(response, "------------------------------------------------------------\n");
+            strcat(response, "|  Filename  | Words | Chars |   Last Access Time  | Owner |\n");
+            strcat(response, "|------------|-------|-------|---------------------|-------|\n");
+        }
+        
+        strcat(response, content);
+
+        if (show_details)
+        {
+            strcat(response, "------------------------------------------------------------\n");
+        }
+
+        send_response(client_sock, response);
+    }
+
     free(files);
 }
 
@@ -655,6 +747,14 @@ void cmd_info(int client_sock, const char *username, const char *filename)
     {
         send_error(client_sock, ERR_FILE_NOT_FOUND);
         return;
+    }
+
+    // refresh size/word/char statistics before showing INFO
+    if (refresh_file_metadata(file) != 0)
+    {
+        char warn_msg[512];
+        snprintf(warn_msg, sizeof(warn_msg), "Using cached metadata for %s", file->filename);
+        log_message("WARN", NULL, 0, username, warn_msg);
     }
 
     char response[BUFFER_SIZE];
@@ -747,6 +847,7 @@ void cmd_add_access(int client_sock, const char *username,
 
     send_response(client_sock, "Access granted successfully!\n");
     log_response(username, ERR_SUCCESS, filename);
+    persist_metadata();
 }
 
 // ================= REMACCESS =================
@@ -776,4 +877,5 @@ void cmd_remove_access(int client_sock, const char *username,
 
     send_response(client_sock, "Access removed successfully!\n");
     log_response(username, ERR_SUCCESS, filename);
+    persist_metadata();
 }

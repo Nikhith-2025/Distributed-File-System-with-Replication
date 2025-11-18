@@ -132,14 +132,22 @@ void *handle_client_thread(void *arg)
         // Register Storage Server
         int ss_index = register_storage_server(client_sock, ss_ip, nm_port, client_port);
 
-        // Add files from SS to NM metadata
+        // add files from SS to NM metadata
         if (ss_index >= 0 && strlen(file_list) > 0)
         {
             char *file_saveptr;
             char *filename = strtok_r(file_list, ",", &file_saveptr);
+            int metadata_changed = 0;
 
             while (filename)
             {
+                trim_string(filename);
+                if (strlen(filename) == 0)
+                {
+                    filename = strtok_r(NULL, ",", &file_saveptr);
+                    continue;
+                }
+
                 FileMetadata meta = {0};
                 strncpy(meta.filename, filename, MAX_FILENAME - 1);
                 strcpy(meta.owner, "system");
@@ -147,9 +155,27 @@ void *handle_client_thread(void *arg)
                 meta.created_time = time(NULL);
                 meta.last_modified = time(NULL);
                 meta.last_accessed = time(NULL);
-                insert_file(&nm_state.file_map, &meta);
+
+                if (insert_file(&nm_state.file_map, &meta) == 0)
+                {
+                    metadata_changed = 1;
+                }
+                else
+                {
+                    FileMetadata *existing = find_file(&nm_state.file_map, filename);
+                    if (existing)
+                    {
+                        existing->ss_index = ss_index;
+                        metadata_changed = 1;
+                    }
+                }
 
                 filename = strtok_r(NULL, ",", &file_saveptr);
+            }
+
+            if (metadata_changed)
+            {
+                persist_metadata();
             }
         }
 

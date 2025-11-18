@@ -49,7 +49,7 @@ int delete_file(FileHashMap *map, const char *filename);
 int get_all_files(FileHashMap *map, FileMetadata ***files_out);
 void free_file_hashmap(FileHashMap *map);
 
-void add_user(const char *username);
+int add_user(const char *username);
 int user_exists(const char *username);
 int get_all_users(char users[][MAX_USERNAME], int max_users);
 
@@ -65,20 +65,28 @@ void add_files_to_ss(int ss_index, char files[][MAX_FILENAME], int file_count);
 int find_least_loaded_ss();
 void deactivate_storage_server(int ss_index);
 StorageServerInfo *get_storage_server(int ss_index);
+void increment_ss_file_count(int ss_index);
 
 AccessLevel check_access(const char *filename, const char *username);
 int add_read_access(const char *filename, const char *username);
 int add_write_access(const char *filename, const char *username);
 int remove_access(const char *filename, const char *username);
 
+// recompute file_size, word_count and char_count by contacting the
+// corresponding Storage Server and reading the latest file contents.
+// Returns 0 on success, -1 on failure (e.g., SS down).
+int refresh_file_metadata(FileMetadata *file);
+
 void init_logging(const char *log_filename);
-void log_message(const char *level, const char *source_ip, int source_port,
-                 const char *username, const char *message);
+void log_message(const char *level, const char *source_ip, int source_port, const char *username, const char *message);
 void log_request(const char *username, const char *command, const char *details);
 void log_response(const char *username, ErrorCode error, const char *details);
 void close_logging();
 
 void init_name_server();
 void cleanup_name_server();
+
+void persist_metadata();
+void load_metadata_from_disk();
 
 #endif
