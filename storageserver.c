@@ -40,6 +40,12 @@ typedef struct stringnode{
     struct stringnode* next;
 }Stringnode;
 
+typedef struct modification {
+    int word_index;
+    char* content;
+    struct modification* next;
+} Modification;
+
 
 
 Stringnode* get_node_at(Stringnode* head, int index) {
@@ -58,6 +64,15 @@ void free_list(Stringnode* head) {
         head = head->next;
         free(temp->str); 
         free(temp); 
+    }
+}
+
+void free_modification_list(Modification* head) {
+    while (head) {
+        Modification* temp = head;
+        head = head->next;
+        free(temp->content);
+        free(temp);
     }
 }
 
@@ -1100,8 +1115,13 @@ void* handle_client_connection(void* args) {
             
             send(conn_args->client_sock, "ACK_WRITE OK\n", 13, 0);
             
-            // Enter write mode - read write commands until ETIRW
+            Modification* modifications = NULL;
+            Modification* modifications_tail = NULL;
             int modifications_made = 0;
+            
+            // Free the initial sentences list since we'll re-read on ETIRW
+            free_list(sentences);
+            sentences = NULL;
             
             while (1) 
             {
@@ -1110,7 +1130,7 @@ void* handle_client_connection(void* args) {
                 if (write_bytes <= 0) 
                 {
                     LOG_WARN("Client disconnected during WRITE session");
-                    free_list(sentences);
+                    free_modification_list(modifications);
                     break;
                 }
                 
@@ -1128,23 +1148,126 @@ void* handle_client_connection(void* args) {
                     // Write modified sentences back to file
                     if (modifications_made > 0) 
                     {
-                        if (write_sentences_to_file(file_path, sentences) == 0) 
+                        // Re-read the file to get the latest state (including other users' changes)
+                        Stringnode* latest_sentences = parse_into_sentences(file_path);
+                        if (!latest_sentences) 
                         {
-                            LOG_INFO("Write successful: %d modifications", modifications_made);
+                            latest_sentences = create_sentence_node("");
+                            if (!latest_sentences) 
+                            {
+                                LOG_ERROR("Failed to allocate memory for latest sentences");
+                                send(conn_args->client_sock, "ERROR Failed to allocate memory\n", 29, 0);
+                                free_modification_list(modifications);
+                                break;
+                            }
+                        }
+                        
+                        // Validate sentence index against latest file state
+                        int latest_sentence_count = count_sentences(latest_sentences);
+                        if (sentence_index < 0 || sentence_index >= latest_sentence_count) 
+                        {
+                            // If sentence_index was valid at start but now out of range,
+                            // it means the file structure changed. Try to handle it.
+                            if (sentence_index == latest_sentence_count) 
+                            {
+                                // Append new sentence if needed
+                                if (latest_sentence_count > 0)
+                                {
+                                    Stringnode* last_sentence = get_node_at(latest_sentences, latest_sentence_count - 1);
+                                    if (last_sentence && !sentence_has_terminal_delimiter(last_sentence->str))
+                                    {
+                                        LOG_WARN("Cannot append sentence %d: previous sentence lacks delimiter", sentence_index);
+                                        send(conn_args->client_sock, "ERROR Cannot append sentence without delimiter\n", 49, 0);
+                                        free_list(latest_sentences);
+                                        free_modification_list(modifications);
+                                        break;
+                                    }
+                                }
+                                Stringnode* new_sentence_node = create_sentence_node("");
+                                if (new_sentence_node) 
+                                {
+                                    append_sentence_to_tail(&latest_sentences, new_sentence_node);
+                                    latest_sentence_count++;
+                                }
+                            }
+                            else 
+                            {
+                                LOG_WARN("Sentence index %d out of range (0-%d) after re-read", sentence_index, latest_sentence_count - 1);
+                                send(conn_args->client_sock, "ERROR Sentence index out of range\n", 33, 0);
+                                free_list(latest_sentences);
+                                free_modification_list(modifications);
+                                break;
+                            }
+                        }
+                        
+                        Stringnode* target_sentence_node = get_node_at(latest_sentences, sentence_index);
+                        if (!target_sentence_node) 
+                        {
+                            LOG_ERROR("Failed to get target sentence node");
+                            send(conn_args->client_sock, "ERROR Failed to get sentence\n", 29, 0);
+                            free_list(latest_sentences);
+                            free_modification_list(modifications);
+                            break;
+                        }
+                        
+                        // Each modification is applied to the result of the previous modification
+                        Modification* mod = modifications;
+                        while (mod) 
+                        {
+                            // Get current sentence text
+                            char* current_sentence_text = target_sentence_node->str;
+                            
+                            char* new_sentence = replace_word_in_sentence(current_sentence_text, mod->word_index, mod->content);
+                            if (!new_sentence) 
+                            {
+                                LOG_WARN("Failed to apply modification: word index %d", mod->word_index);
+                                mod = mod->next;
+                                continue;
+                            }
+
+                            char* first_sentence_part = NULL;
+                            Stringnode* extra_sentences_split = NULL;
+                            if (split_sentence_string(new_sentence, &first_sentence_part, &extra_sentences_split) != 0)
+                            {
+                                free(new_sentence);
+                                LOG_WARN("Failed to split sentence after modification");
+                                mod = mod->next;
+                                continue;
+                            }
+                            free(new_sentence);
+                            
+                            // Update the sentence with the result of this modification
+                            free(target_sentence_node->str);
+                            target_sentence_node->str = first_sentence_part;
+                            if (extra_sentences_split)
+                            {
+                                append_sentence_nodes(target_sentence_node, extra_sentences_split);
+                                LOG_INFO("Sentence %d split into additional sentences", sentence_index);
+                            }
+                            
+                            mod = mod->next;
+                        }
+                        
+                        // Write the updated sentences back to file
+                        if (write_sentences_to_file(file_path, latest_sentences) == 0) 
+                        {
+                            LOG_INFO("Write successful: %d modifications applied to latest file state", modifications_made);
                             send(conn_args->client_sock, "Write Successful!\n", 18, 0);
                         } 
-                        
-                        else {
+                        else 
+                        {
                             LOG_ERROR("Failed to write file back");
                             send(conn_args->client_sock, "ERROR Failed to write file\n", 27, 0);
                         }
+                        
+                        free_list(latest_sentences);
                     } 
                     else 
                     {
                         send(conn_args->client_sock, "No modifications made\n", 22, 0);
                     }
                     
-                    free_list(sentences);
+                    free_modification_list(modifications);
                     break;
                 }
         
@@ -1166,45 +1289,29 @@ void* handle_client_connection(void* args) {
                     continue;
                 }
                 
-                int word_index = user_word_index;
-
-                Stringnode* target_sentence_node = get_node_at(sentences, sentence_index);
-                if (!target_sentence_node) 
+                // Store the modification instead of applying it immediately
+                Modification* new_mod = (Modification*)malloc(sizeof(Modification));
+                if (!new_mod) 
                 {
-                    send(conn_args->client_sock, "ERROR Failed to get sentence\n", 29, 0);
+                    send(conn_args->client_sock, "ERROR Failed to allocate memory\n", 29, 0);
                     continue;
+                }
+                new_mod->word_index = user_word_index;
+                new_mod->content = strdup(new_content);
+                new_mod->next = NULL;
+                
+                if (!modifications) 
+                {
+                    modifications = modifications_tail = new_mod;
+                } 
+                else 
+                {
+                    modifications_tail->next = new_mod;
+                    modifications_tail = new_mod;
                 }
                 
-                char* new_sentence = replace_word_in_sentence(target_sentence_node->str, word_index, new_content);
-                if (!new_sentence) 
-                {
-                    char err[128];
-                    snprintf(err, sizeof(err), "ERROR Word index %d invalid\n", user_word_index);
-                    send(conn_args->client_sock, err, strlen(err), 0);
-                    continue;
-                }
-
-                char* first_sentence_part = NULL;
-                Stringnode* extra_sentences = NULL;
-                if (split_sentence_string(new_sentence, &first_sentence_part, &extra_sentences) != 0)
-                {
-                    free(new_sentence);
-                    send(conn_args->client_sock, "ERROR Failed to split sentence\n", 32, 0);
-                    continue;
-                }
-                free(new_sentence);
-                
-                // Update the sentence
-                free(target_sentence_node->str);
-                target_sentence_node->str = first_sentence_part;
-                if (extra_sentences)
-                {
-                    append_sentence_nodes(target_sentence_node, extra_sentences);
-                    LOG_INFO("Sentence %d split into additional sentences", sentence_index);
-                }
                 modifications_made++;
-                
-                LOG_INFO("Updated sentence %d, word %d", sentence_index, user_word_index);
+                LOG_INFO("Stored modification: sentence %d, word %d", sentence_index, user_word_index);
                 send(conn_args->client_sock, "OK\n", 3, 0);
             }
         }
