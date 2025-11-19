@@ -18,12 +18,14 @@
 #define MAX_FILENAME 256
 #define MAX_USERNAME 64
 #define MAX_PATH 512
+#define MAX_FOLDER_PATH MAX_PATH
 #define MAX_COMMAND 1024
 #define BUFFER_SIZE 4096
 #define MAX_FILES 10000
 #define MAX_USERS 1000
 #define MAX_STORAGE_SERVERS 100
 #define MAX_ACCESS_USERS 100
+#define MAX_ACCESS_REQUESTS 100
 #define INET_ADDRSTRLEN 16
 
 typedef enum
@@ -46,7 +48,15 @@ typedef enum
     ERR_WRITE_MODE_ACTIVE,
     ERR_NOT_IN_WRITE_MODE,
     ERR_FILE_LOCKED,
-    ERR_NO_UNDO_HISTORY
+    ERR_NO_UNDO_HISTORY,
+    ERR_FOLDER_NOT_FOUND,
+    ERR_FOLDER_ALREADY_EXISTS,
+    ERR_INVALID_PATH,
+    ERR_NOT_FOLDER_OWNER,
+    ERR_ALREADY_HAS_ACCESS,
+    ERR_REQUEST_ALREADY_EXISTS,
+    ERR_REQUEST_NOT_FOUND,
+    ERR_INVALID_ACCESS_LEVEL
 } ErrorCode;
 
 typedef enum
@@ -82,9 +92,17 @@ typedef enum
 
 typedef struct
 {
+    char username[MAX_USERNAME];
+    AccessLevel requested_level;
+    time_t requested_at;
+} AccessRequest;
+
+typedef struct
+{
     char filename[MAX_FILENAME];
     char owner[MAX_USERNAME];
     int ss_index;
+    int replica_ss_index;
 
     char readers[MAX_ACCESS_USERS][MAX_USERNAME];
     int reader_count;
@@ -102,6 +120,9 @@ typedef struct
     int is_locked;
     int locked_sentence;
     char locked_by[MAX_USERNAME];
+
+    AccessRequest requests[MAX_ACCESS_REQUESTS];
+    int request_count;
 } FileMetadata;
 
 typedef struct
@@ -169,6 +190,14 @@ static inline const char *get_error_message(ErrorCode code)
         case ERR_NOT_IN_WRITE_MODE: return "ERROR: Not in write mode";
         case ERR_FILE_LOCKED: return "ERROR: File is locked";
         case ERR_NO_UNDO_HISTORY: return "ERROR: No undo history available";
+        case ERR_FOLDER_NOT_FOUND: return "ERROR: Folder not found";
+        case ERR_FOLDER_ALREADY_EXISTS: return "ERROR: Folder already exists";
+        case ERR_INVALID_PATH: return "ERROR: Invalid path";
+        case ERR_NOT_FOLDER_OWNER: return "ERROR: You are not the folder owner";
+        case ERR_ALREADY_HAS_ACCESS: return "ERROR: You already have the requested access";
+        case ERR_REQUEST_ALREADY_EXISTS: return "ERROR: A pending request already exists";
+        case ERR_REQUEST_NOT_FOUND: return "ERROR: No matching access request found";
+        case ERR_INVALID_ACCESS_LEVEL: return "ERROR: Invalid access level";
         default: return "ERROR: Unknown error";
     }
 }

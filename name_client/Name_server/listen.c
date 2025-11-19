@@ -165,7 +165,12 @@ void *handle_client_thread(void *arg)
                     FileMetadata *existing = find_file(&nm_state.file_map, filename);
                     if (existing)
                     {
-                        existing->ss_index = ss_index;
+                       if (existing->ss_index >= 0 && nm_state.storage_servers[existing->ss_index].active) {
+                            existing->replica_ss_index = ss_index;
+                        } 
+                        else {
+                            existing->ss_index = ss_index;
+                        }
                         metadata_changed = 1;
                     }
                 }
@@ -237,18 +242,51 @@ void *handle_client_thread(void *arg)
         }
 
         buffer[bytes] = '\0';
-        trim_string(buffer);
-
-        if (strcasecmp(buffer, "EXIT") == 0 || strcasecmp(buffer, "QUIT") == 0)
+        
+        // Split buffer by newlines and process each command separately
+        char *line = buffer;
+        char *next_line;
+        while (line && *line)
         {
-            send(client_sock, "Goodbye!\n", 9, 0);
-            break;
+            // Find the next newline
+            next_line = strchr(line, '\n');
+            if (next_line)
+            {
+                *next_line = '\0';
+                next_line++;
+            }
+            
+            // Trim current line
+            char *cmd_start = line;
+            while (*cmd_start == ' ' || *cmd_start == '\t' || *cmd_start == '\r')
+                cmd_start++;
+            
+            char *cmd_end = cmd_start + strlen(cmd_start) - 1;
+            while (cmd_end >= cmd_start && (*cmd_end == ' ' || *cmd_end == '\t' || *cmd_end == '\r'))
+                cmd_end--;
+            cmd_end[1] = '\0';
+            
+            if (*cmd_start == '\0')
+            {
+                line = next_line;
+                continue;
+            }
+            
+            if (strcasecmp(cmd_start, "EXIT") == 0 || strcasecmp(cmd_start, "QUIT") == 0)
+            {
+                send(client_sock, "Goodbye!\n", 9, 0);
+                goto client_exit;
+            }
+
+            printf("[NM] %s: %s\n", username, cmd_start);
+
+            handle_command(client_sock, username, cmd_start);
+            
+            line = next_line;
         }
-
-        printf("[NM] %s: %s\n", username, buffer);
-
-        handle_command(client_sock, username, buffer);
     }
+    
+client_exit:
 
     // Client exits
     printf("[NM] Client %s disconnected\n", username);

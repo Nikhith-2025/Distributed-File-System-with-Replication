@@ -165,6 +165,245 @@ void free_file_hashmap(FileHashMap *map)
     pthread_mutex_destroy(&map->lock);
 }
 
+// ==================== FOLDER MAP ====================
+
+static unsigned int hash_folder_path(const char *path)
+{
+    return hash_filename(path ? path : "");
+}
+
+static void ensure_folder_hierarchy_for_file(const char *file_path, const char *owner)
+{
+    if (!file_path)
+    {
+        return;
+    }
+
+    const char *last_slash = strrchr(file_path, '/');
+    if (!last_slash)
+    {
+        ensure_root_folder();
+        return;
+    }
+
+    char partial[MAX_FOLDER_PATH];
+    partial[0] = '\0';
+    const char *cursor = file_path;
+
+    while (cursor < last_slash)
+    {
+        const char *next = strchr(cursor, '/');
+        if (!next || next > last_slash)
+        {
+            break;
+        }
+        size_t segment_len = (size_t)(next - cursor);
+        if (segment_len == 0)
+        {
+            cursor = next + 1;
+            continue;
+        }
+
+        if (partial[0] != '\0')
+        {
+            strncat(partial, "/", sizeof(partial) - strlen(partial) - 1);
+        }
+        strncat(partial, cursor, segment_len);
+
+        if (!find_folder(&nm_state.folder_map, partial))
+        {
+            FolderMetadata meta = {0};
+            strncpy(meta.path, partial, MAX_FOLDER_PATH - 1);
+            if (owner && owner[0] != '\0')
+            {
+                strncpy(meta.owner, owner, MAX_USERNAME - 1);
+            }
+            else
+            {
+                strncpy(meta.owner, "system", MAX_USERNAME - 1);
+            }
+            meta.created_time = time(NULL);
+            insert_folder(&nm_state.folder_map, &meta);
+        }
+
+        cursor = next + 1;
+    }
+
+    ensure_root_folder();
+}
+
+void init_folder_hashmap(FolderHashMap *map)
+{
+    memset(map->buckets, 0, sizeof(map->buckets));
+    pthread_mutex_init(&map->lock, NULL);
+    map->total_folders = 0;
+}
+
+int insert_folder(FolderHashMap *map, FolderMetadata *metadata)
+{
+    if (!map || !metadata)
+    {
+        return -1;
+    }
+
+    unsigned int index = hash_folder_path(metadata->path) % HASH_TABLE_SIZE;
+
+    pthread_mutex_lock(&map->lock);
+    FolderNode *current = map->buckets[index];
+    while (current)
+    {
+        if (strcmp(current->metadata.path, metadata->path) == 0)
+        {
+            current->metadata = *metadata;
+            pthread_mutex_unlock(&map->lock);
+            return 0;
+        }
+        current = current->next;
+    }
+
+    FolderNode *node = malloc(sizeof(FolderNode));
+    if (!node)
+    {
+        pthread_mutex_unlock(&map->lock);
+        return -1;
+    }
+    node->metadata = *metadata;
+    node->next = map->buckets[index];
+    map->buckets[index] = node;
+    map->total_folders++;
+
+    pthread_mutex_unlock(&map->lock);
+    return 0;
+}
+
+FolderMetadata *find_folder(FolderHashMap *map, const char *path)
+{
+    if (!map || !path)
+    {
+        return NULL;
+    }
+
+    unsigned int index = hash_folder_path(path) % HASH_TABLE_SIZE;
+
+    pthread_mutex_lock(&map->lock);
+    FolderNode *current = map->buckets[index];
+    while (current)
+    {
+        if (strcmp(current->metadata.path, path) == 0)
+        {
+            pthread_mutex_unlock(&map->lock);
+            return &current->metadata;
+        }
+        current = current->next;
+    }
+    pthread_mutex_unlock(&map->lock);
+    return NULL;
+}
+
+int delete_folder(FolderHashMap *map, const char *path)
+{
+    if (!map || !path)
+    {
+        return -1;
+    }
+
+    unsigned int index = hash_folder_path(path) % HASH_TABLE_SIZE;
+
+    pthread_mutex_lock(&map->lock);
+    FolderNode *current = map->buckets[index];
+    FolderNode *prev = NULL;
+
+    while (current)
+    {
+        if (strcmp(current->metadata.path, path) == 0)
+        {
+            if (prev)
+            {
+                prev->next = current->next;
+            }
+            else
+            {
+                map->buckets[index] = current->next;
+            }
+
+            free(current);
+            map->total_folders--;
+            pthread_mutex_unlock(&map->lock);
+            return 0;
+        }
+        prev = current;
+        current = current->next;
+    }
+
+    pthread_mutex_unlock(&map->lock);
+    return -1;
+}
+
+int get_all_folders(FolderHashMap *map, FolderMetadata ***folders_out)
+{
+    pthread_mutex_lock(&map->lock);
+
+    if (map->total_folders == 0)
+    {
+        *folders_out = NULL;
+        pthread_mutex_unlock(&map->lock);
+        return 0;
+    }
+
+    FolderMetadata **folders = malloc(sizeof(FolderMetadata *) * map->total_folders);
+    int count = 0;
+
+    for (int i = 0; i < HASH_TABLE_SIZE; i++)
+    {
+        FolderNode *current = map->buckets[i];
+        while (current)
+        {
+            folders[count++] = &current->metadata;
+            current = current->next;
+        }
+    }
+
+    *folders_out = folders;
+    pthread_mutex_unlock(&map->lock);
+    return count;
+}
+
+void free_folder_hashmap(FolderHashMap *map)
+{
+    pthread_mutex_lock(&map->lock);
+
+    for (int i = 0; i < HASH_TABLE_SIZE; i++)
+    {
+        FolderNode *current = map->buckets[i];
+        while (current)
+        {
+            FolderNode *tmp = current;
+            current = current->next;
+            free(tmp);
+        }
+        map->buckets[i] = NULL;
+    }
+    map->total_folders = 0;
+
+    pthread_mutex_unlock(&map->lock);
+    pthread_mutex_destroy(&map->lock);
+}
+
+void ensure_root_folder(void)
+{
+    FolderMetadata *root = find_folder(&nm_state.folder_map, "");
+    if (root)
+    {
+        return;
+    }
+
+    FolderMetadata meta = {0};
+    meta.path[0] = '\0';
+    strncpy(meta.owner, "system", MAX_USERNAME - 1);
+    meta.created_time = time(NULL);
+    insert_folder(&nm_state.folder_map, &meta);
+}
+
 // ==================== USER MANAGEMENT ====================
 
 int add_user(const char *username)
@@ -359,20 +598,10 @@ int register_storage_server(int sockfd, const char *ip, int nm_port, int client_
 
 void add_files_to_ss(int ss_index, char files[][MAX_FILENAME], int file_count)
 {
-    pthread_mutex_lock(&nm_state.ss_lock);
-
-    if (ss_index >= 0 && ss_index < nm_state.storage_count)
+    for (int i = 0; i < file_count; i++)
     {
-        StorageServerInfo *ss = &nm_state.storage_servers[ss_index];
-
-        for (int i = 0; i < file_count && ss->file_count < MAX_FILES; i++)
-        {
-            strncpy(ss->files[ss->file_count], files[i], MAX_FILENAME - 1);
-            ss->file_count++;
-        }
+        track_file_on_ss(ss_index, files[i]);
     }
-
-    pthread_mutex_unlock(&nm_state.ss_lock);
 }
 
 int find_least_loaded_ss()
@@ -394,6 +623,128 @@ int find_least_loaded_ss()
 
     pthread_mutex_unlock(&nm_state.ss_lock);
     return best;
+}
+
+int find_replica_ss(int exclude_index)
+{
+    pthread_mutex_lock(&nm_state.ss_lock);
+
+    int best = -1;
+    int min_files = MAX_FILES + 1;
+
+    for (int i = 0; i < nm_state.storage_count; i++)
+    {
+        if (i == exclude_index)
+        {
+            continue;
+        }
+        if (nm_state.storage_servers[i].active &&
+            nm_state.storage_servers[i].file_count < min_files)
+        {
+            min_files = nm_state.storage_servers[i].file_count;
+            best = i;
+        }
+    }
+
+    pthread_mutex_unlock(&nm_state.ss_lock);
+    return best;
+}
+
+void track_file_on_ss(int ss_index, const char *filename)
+{
+    if (ss_index < 0)
+    {
+        return;
+    }
+
+    pthread_mutex_lock(&nm_state.ss_lock);
+    if (ss_index >= 0 && ss_index < nm_state.storage_count)
+    {
+        StorageServerInfo *ss = &nm_state.storage_servers[ss_index];
+        if (filename && ss->file_count < MAX_FILES)
+        {
+            strncpy(ss->files[ss->file_count], filename, MAX_FILENAME - 1);
+            ss->files[ss->file_count][MAX_FILENAME - 1] = '\0';
+        }
+        if (ss->file_count < MAX_FILES)
+        {
+            ss->file_count++;
+        }
+
+        char log_buf[128];
+        snprintf(log_buf, sizeof(log_buf), "Load updated: SS %d now has %d files.",
+                 ss_index, ss->file_count);
+        log_message("INFO", ss->ip, ss->nm_port, "SYSTEM", log_buf);
+    }
+    pthread_mutex_unlock(&nm_state.ss_lock);
+}
+
+void untrack_file_on_ss(int ss_index, const char *filename)
+{
+    if (ss_index < 0)
+    {
+        return;
+    }
+
+    pthread_mutex_lock(&nm_state.ss_lock);
+    if (ss_index >= 0 && ss_index < nm_state.storage_count)
+    {
+        StorageServerInfo *ss = &nm_state.storage_servers[ss_index];
+        if (filename)
+        {
+            for (int i = 0; i < ss->file_count; i++)
+            {
+                if (strcmp(ss->files[i], filename) == 0)
+                {
+                    for (int j = i; j < ss->file_count - 1; j++)
+                    {
+                        strncpy(ss->files[j], ss->files[j + 1], MAX_FILENAME);
+                    }
+                    ss->file_count--;
+                    break;
+                }
+            }
+        }
+        else if (ss->file_count > 0)
+        {
+            ss->file_count--;
+        }
+
+        if (ss->file_count < 0)
+        {
+            ss->file_count = 0;
+        }
+
+        char log_buf[128];
+        snprintf(log_buf, sizeof(log_buf), "Load updated: SS %d now has %d files.",
+                 ss_index, ss->file_count);
+        log_message("INFO", ss->ip, ss->nm_port, "SYSTEM", log_buf);
+    }
+    pthread_mutex_unlock(&nm_state.ss_lock);
+}
+
+void rename_tracked_file_on_ss(int ss_index, const char *old_name, const char *new_name)
+{
+    if (ss_index < 0 || !old_name || !new_name)
+    {
+        return;
+    }
+
+    pthread_mutex_lock(&nm_state.ss_lock);
+    if (ss_index >= 0 && ss_index < nm_state.storage_count)
+    {
+        StorageServerInfo *ss = &nm_state.storage_servers[ss_index];
+        for (int i = 0; i < ss->file_count; i++)
+        {
+            if (strcmp(ss->files[i], old_name) == 0)
+            {
+                strncpy(ss->files[i], new_name, MAX_FILENAME - 1);
+                ss->files[i][MAX_FILENAME - 1] = '\0';
+                break;
+            }
+        }
+    }
+    pthread_mutex_unlock(&nm_state.ss_lock);
 }
 
 void deactivate_storage_server(int ss_index)
@@ -816,6 +1167,7 @@ void persist_metadata()
             fprintf(fp, "FILE %s\n", meta->filename);
             fprintf(fp, "OWNER %s\n", meta->owner);
             fprintf(fp, "SS_INDEX %d\n", meta->ss_index);
+            fprintf(fp, "REPLICA_INDEX %d\n", meta->replica_ss_index);
             fprintf(fp, "CREATED %ld\n", (long)meta->created_time);
             fprintf(fp, "LAST_MOD %ld\n", (long)meta->last_modified);
             fprintf(fp, "LAST_ACC %ld\n", (long)meta->last_accessed);
@@ -831,11 +1183,36 @@ void persist_metadata()
             {
                 fprintf(fp, "READER %s\n", meta->readers[r]);
             }
+            for (int rq = 0; rq < meta->request_count; rq++)
+            {
+                AccessRequest *req = &meta->requests[rq];
+                fprintf(fp, "REQUEST %s %d %ld\n",
+                        req->username,
+                        (int)req->requested_level,
+                        (long)req->requested_at);
+            }
             fprintf(fp, "FILE_END\n");
             current = current->next;
         }
     }
     pthread_mutex_unlock(&nm_state.file_map.lock);
+
+    pthread_mutex_lock(&nm_state.folder_map.lock);
+    fprintf(fp, "FOLDERS %d\n", nm_state.folder_map.total_folders);
+    for (int i = 0; i < HASH_TABLE_SIZE; i++)
+    {
+        FolderNode *current = nm_state.folder_map.buckets[i];
+        while (current)
+        {
+            FolderMetadata *meta = &current->metadata;
+            fprintf(fp, "FOLDER %s\n", meta->path[0] == '\0' ? "/" : meta->path);
+            fprintf(fp, "OWNER %s\n", meta->owner);
+            fprintf(fp, "CREATED %ld\n", (long)meta->created_time);
+            fprintf(fp, "FOLDER_END\n");
+            current = current->next;
+        }
+    }
+    pthread_mutex_unlock(&nm_state.folder_map.lock);
 
     pthread_mutex_lock(&nm_state.user_lock);
     fprintf(fp, "USERS %d\n", nm_state.user_count);
@@ -857,6 +1234,7 @@ static void finalize_loaded_file(FileMetadata *meta)
     meta->locked_sentence = -1;
     meta->locked_by[0] = '\0';
     meta->is_locked = 0;
+    ensure_folder_hierarchy_for_file(meta->filename, meta->owner);
     insert_file(&nm_state.file_map, meta);
 }
 
@@ -870,13 +1248,64 @@ void load_metadata_from_disk()
 
     char line[BUFFER_SIZE];
     FileMetadata meta = {0};
+    FolderMetadata folder_meta = {0};
     int in_file_block = 0;
+    int in_folder_block = 0;
 
     while (fgets(line, sizeof(line), fp))
     {
         trim_string(line);
         if (line[0] == '\0')
         {
+            continue;
+        }
+
+        if (strncmp(line, "FOLDERS ", 8) == 0)
+        {
+            continue;
+        }
+
+        if (strncmp(line, "FOLDER ", 7) == 0)
+        {
+            if (in_file_block)
+            {
+                finalize_loaded_file(&meta);
+                in_file_block = 0;
+            }
+            if (in_folder_block)
+            {
+                insert_folder(&nm_state.folder_map, &folder_meta);
+            }
+            memset(&folder_meta, 0, sizeof(folder_meta));
+            const char *path_value = line + 7;
+            if (strcmp(path_value, "/") == 0)
+            {
+                folder_meta.path[0] = '\0';
+            }
+            else
+            {
+                strncpy(folder_meta.path, path_value, MAX_FOLDER_PATH - 1);
+            }
+            folder_meta.created_time = time(NULL);
+            in_folder_block = 1;
+            continue;
+        }
+
+        if (in_folder_block)
+        {
+            if (strcmp(line, "FOLDER_END") == 0)
+            {
+                insert_folder(&nm_state.folder_map, &folder_meta);
+                in_folder_block = 0;
+            }
+            else if (strncmp(line, "OWNER ", 6) == 0)
+            {
+                strncpy(folder_meta.owner, line + 6, MAX_USERNAME - 1);
+            }
+            else if (strncmp(line, "CREATED ", 8) == 0)
+            {
+                folder_meta.created_time = (time_t)atoll(line + 8);
+            }
             continue;
         }
 
@@ -889,6 +1318,7 @@ void load_metadata_from_disk()
             memset(&meta, 0, sizeof(meta));
             strncpy(meta.filename, line + 5, MAX_FILENAME - 1);
             meta.ss_index = -1;
+            meta.replica_ss_index = -1;
             in_file_block = 1;
             continue;
         }
@@ -908,6 +1338,10 @@ void load_metadata_from_disk()
             else if (strncmp(line, "SS_INDEX ", 9) == 0)
             {
                 meta.ss_index = atoi(line + 9);
+            }
+            else if (strncmp(line, "REPLICA_INDEX ", 14) == 0)
+            {
+                meta.replica_ss_index = atoi(line + 14);
             }
             else if (strncmp(line, "CREATED ", 8) == 0)
             {
@@ -955,6 +1389,26 @@ void load_metadata_from_disk()
                     meta.reader_count++;
                 }
             }
+            else if (strncmp(line, "REQUEST ", 8) == 0)
+            {
+                if (meta.request_count < MAX_ACCESS_REQUESTS)
+                {
+                    char req_user[MAX_USERNAME];
+                    int level = 0;
+                    long ts = 0;
+                    req_user[0] = '\0';
+                    const char *payload = line + 8;
+                    if (sscanf(payload, "%63s %d %ld", req_user, &level, &ts) >= 2)
+                    {
+                        AccessRequest *req = &meta.requests[meta.request_count];
+                        strncpy(req->username, req_user, MAX_USERNAME - 1);
+                        req->username[MAX_USERNAME - 1] = '\0';
+                        req->requested_level = (AccessLevel)level;
+                        req->requested_at = ts ? (time_t)ts : time(NULL);
+                        meta.request_count++;
+                    }
+                }
+            }
             continue;
         }
 
@@ -983,6 +1437,10 @@ void load_metadata_from_disk()
     if (in_file_block)
     {
         finalize_loaded_file(&meta);
+    }
+    if (in_folder_block)
+    {
+        insert_folder(&nm_state.folder_map, &folder_meta);
     }
 
     fclose(fp);
@@ -1022,6 +1480,7 @@ void remove_storage_server(int index)
 void init_name_server()
 {
     init_file_hashmap(&nm_state.file_map);
+    init_folder_hashmap(&nm_state.folder_map);
 
     nm_state.storage_count = 0;
     pthread_mutex_init(&nm_state.ss_lock, NULL);
@@ -1036,6 +1495,7 @@ void init_name_server()
     log_message("INFO", NULL, 0, NULL, "Name Server initialized");
 
     load_metadata_from_disk();
+    ensure_root_folder();
 }
 
 void cleanup_name_server()
@@ -1043,6 +1503,7 @@ void cleanup_name_server()
     log_message("INFO", NULL, 0, NULL, "Name Server shutting down");
 
     free_file_hashmap(&nm_state.file_map);
+    free_folder_hashmap(&nm_state.folder_map);
 
     pthread_mutex_lock(&nm_state.client_lock);
     for (int i = 0; i < nm_state.client_count; i++)

@@ -13,6 +13,19 @@ typedef struct FileNode
 
 typedef struct
 {
+    char path[MAX_FOLDER_PATH];
+    char owner[MAX_USERNAME];
+    time_t created_time;
+} FolderMetadata;
+
+typedef struct FolderNode
+{
+    FolderMetadata metadata;
+    struct FolderNode *next;
+} FolderNode;
+
+typedef struct
+{
     FileNode *buckets[HASH_TABLE_SIZE];
     pthread_mutex_t lock;
     int total_files;
@@ -20,7 +33,15 @@ typedef struct
 
 typedef struct
 {
+    FolderNode *buckets[HASH_TABLE_SIZE];
+    pthread_mutex_t lock;
+    int total_folders;
+} FolderHashMap;
+
+typedef struct
+{
     FileHashMap file_map;
+    FolderHashMap folder_map;
 
     StorageServerInfo storage_servers[MAX_STORAGE_SERVERS];
     int storage_count;
@@ -49,6 +70,14 @@ int delete_file(FileHashMap *map, const char *filename);
 int get_all_files(FileHashMap *map, FileMetadata ***files_out);
 void free_file_hashmap(FileHashMap *map);
 
+void init_folder_hashmap(FolderHashMap *map);
+int insert_folder(FolderHashMap *map, FolderMetadata *metadata);
+FolderMetadata *find_folder(FolderHashMap *map, const char *path);
+int delete_folder(FolderHashMap *map, const char *path);
+int get_all_folders(FolderHashMap *map, FolderMetadata ***folders_out);
+void free_folder_hashmap(FolderHashMap *map);
+void ensure_root_folder(void);
+
 int add_user(const char *username);
 int user_exists(const char *username);
 int get_all_users(char users[][MAX_USERNAME], int max_users);
@@ -63,9 +92,13 @@ StorageServerInfo *get_available_storage_server();
 void remove_storage_server(int index);
 void add_files_to_ss(int ss_index, char files[][MAX_FILENAME], int file_count);
 int find_least_loaded_ss();
+int find_replica_ss(int exclude_index);
 void deactivate_storage_server(int ss_index);
 StorageServerInfo *get_storage_server(int ss_index);
 void increment_ss_file_count(int ss_index);
+void track_file_on_ss(int ss_index, const char *filename);
+void untrack_file_on_ss(int ss_index, const char *filename);
+void rename_tracked_file_on_ss(int ss_index, const char *old_name, const char *new_name);
 
 AccessLevel check_access(const char *filename, const char *username);
 int add_read_access(const char *filename, const char *username);
