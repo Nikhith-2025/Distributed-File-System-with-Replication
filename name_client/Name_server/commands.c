@@ -15,7 +15,7 @@ static int connect_to_ss(StorageServerInfo *ss);
 static int read_line(int sock, char *buffer, size_t buf_size);
 static const char *find_sequence(const char *haystack, size_t hay_len, const char *needle, size_t needle_len);
 static int forward_until_stop(int src_sock, int dst_sock);
-#include <stdarg.h>
+
 
 static int normalize_path_common(const char *input, char *output, size_t out_size, int allow_root)
 {
