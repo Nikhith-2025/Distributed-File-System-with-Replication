@@ -4,6 +4,7 @@
 #include <unistd.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
+#include <netinet/tcp.h>
 #include <arpa/inet.h>
 #include <pthread.h>
 #include <sys/stat.h>
@@ -20,6 +21,7 @@ char SS_STORAGE_DIR[128] = "storage/";
 
 #define LOG_FILE "storage_server.log"
 #define STOP_PACKET "\n--STOP--\n"
+#define NM_RESP_BUFFER 4096
 
 #define NM_IP "127.0.0.1"
 #define NM_REGISTER_PORT 8000
@@ -48,6 +50,11 @@ typedef struct modification {
 
 
 
+void server_log(const char* level, const char* fmt, ...);
+static int ensure_dirs_for_full_path(const char* full_path);
+static int ensure_parent_dirs_for_relative(const char* relative_path);
+static void send_simple_response(int sock, const char* msg);
+
 Stringnode* get_node_at(Stringnode* head, int index) {
 
     for (int i = 0; head != NULL && i < index; i++) {
@@ -72,7 +79,7 @@ void free_modification_list(Modification* head) {
         Modification* temp = head;
         head = head->next;
         free(temp->content);
-        free(temp);
+        free(temp); 
     }
 }
 
@@ -468,6 +475,11 @@ static int split_sentence_string(const char* sentence_text,
 // Write sentences back to file
 int write_sentences_to_file(const char* file_path, Stringnode* sentences) 
 {
+    if (ensure_dirs_for_full_path(file_path) != 0)
+    {
+        server_log("WARN", "Failed to ensure directories for %s", file_path);
+    }
+
     FILE* fp = fopen(file_path, "w");
     if (!fp) 
     {
@@ -521,52 +533,89 @@ void server_log(const char* level, const char* fmt, ...){
 #define LOG_WARN(...) server_log("WARN", __VA_ARGS__)
 #define LOG_ERROR(...) server_log("ERROR", __VA_ARGS__)
 
-int scan_storage_directory(char* file_list_buffer, int buffer_size){
-
-    memset(file_list_buffer, 0, buffer_size); // clear the buffer
-    DIR *d;
-    struct dirent *dir;
-
-    d = opendir(SS_STORAGE_DIR);
-    if (!d) {
-        LOG_ERROR("Could not open storage directory: %s: %s", SS_STORAGE_DIR, strerror(errno));
-        return -1;
+static void append_file_entry(char* buffer, int buffer_size, int* buffer_pos, int* first_file, const char* entry) {
+    if (*first_file) {
+        *first_file = 0;
+    } else {
+        if (*buffer_pos + 1 >= buffer_size) {
+            LOG_WARN("File list buffer too small during scan.");
+            return;
+        }
+        buffer[(*buffer_pos)++] = ',';
     }
 
-    int first_file = 1;
-    int buffer_pos = 0;
+    int len = strlen(entry);
+    if (*buffer_pos + len >= buffer_size) {
+        LOG_WARN("File list buffer too small during scan.");
+        return;
+    }
+    strncpy(buffer + *buffer_pos, entry, len);
+    *buffer_pos += len;
+    buffer[*buffer_pos] = '\0';
+}
 
-    while((dir = readdir(d)) != NULL){
+static void scan_directory_recursive(const char* base_dir, const char* relative_path,
+                                     char* buffer, int buffer_size, int* buffer_pos, int* first_file) {
+    char actual_path[512];
+    if (relative_path && relative_path[0] != '\0') {
+        snprintf(actual_path, sizeof(actual_path), "%s%s", base_dir, relative_path);
+    } else {
+        snprintf(actual_path, sizeof(actual_path), "%s", base_dir);
+    }
 
+    DIR* d = opendir(actual_path);
+    if (!d) {
+        return;
+    }
+
+    struct dirent* dir;
+    while ((dir = readdir(d)) != NULL) {
         if (strcmp(dir->d_name, ".") == 0 || strcmp(dir->d_name, "..") == 0) {
             continue;
         }
 
-        if (strstr(dir->d_name, ".undo") != NULL) {
+        char child_relative[512];
+        if (relative_path && relative_path[0] != '\0') {
+            snprintf(child_relative, sizeof(child_relative), "%s/%s", relative_path, dir->d_name);
+        } else {
+            snprintf(child_relative, sizeof(child_relative), "%s", dir->d_name);
+        }
+
+        char child_full[512];
+        snprintf(child_full, sizeof(child_full), "%s%s", base_dir, child_relative);
+
+        struct stat st;
+        if (stat(child_full, &st) != 0) {
             continue;
         }
 
-        // add comma before file name
-        if (!first_file) {
-            if (buffer_pos + 1 >= buffer_size) {
-                LOG_WARN("File list buffer too small during scan.");
-                break;
-            }
-            file_list_buffer[buffer_pos++] = ',';
+        if (S_ISDIR(st.st_mode)) {
+            scan_directory_recursive(base_dir, child_relative, buffer, buffer_size, buffer_pos, first_file);
+        } else {
+        if (strstr(dir->d_name, ".undo") != NULL) {
+            continue;
         }
-
-        // add filename
-        int name_len = strlen(dir->d_name);
-        if (buffer_pos + name_len >= buffer_size) {
-            LOG_WARN("File list buffer too small during scan.");
-            break;
+            append_file_entry(buffer, buffer_size, buffer_pos, first_file, child_relative);
         }
-        strncpy(file_list_buffer + buffer_pos, dir->d_name, name_len);
-        buffer_pos += name_len;
+    }
 
-        first_file = 0;
+    closedir(d);
+}
+
+int scan_storage_directory(char* file_list_buffer, int buffer_size){
+
+    memset(file_list_buffer, 0, buffer_size); // clear the buffer
+
+    DIR *d = opendir(SS_STORAGE_DIR);
+    if (!d) {
+        LOG_ERROR("Could not open storage directory: %s: %s", SS_STORAGE_DIR, strerror(errno));
+        return -1;
     }
     closedir(d);
+
+    int first_file = 1;
+    int buffer_pos = 0;
+    scan_directory_recursive(SS_STORAGE_DIR, "", file_list_buffer, buffer_size, &buffer_pos, &first_file);
 
     if (first_file) {
         LOG_INFO("No existing files found in storage directory.");
@@ -658,14 +707,144 @@ typedef struct {
 
 int is_filename_valid(const char* filename) {
 
+    if (!filename || filename[0] == '\0') {
+        return 0;
+    }
+
     if (strstr(filename, "..") != NULL) {
         return 0;
     }
 
-    if (strchr(filename, '/') != NULL || strchr(filename, '\\') != NULL) {
+    if (filename[0] == '/' || strchr(filename, '\\') != NULL) {
         return 0;
     }
+
     return 1; 
+}
+
+static int is_tag_valid(const char* tag)
+{
+    if (!tag || tag[0] == '\0')
+    {
+        return 0;
+    }
+    for (const char* p = tag; *p; ++p)
+    {
+        if (*p == '/' || *p == '\\' || *p == '|' || *p == '\n' || *p == '\r')
+        {
+            return 0;
+        }
+    }
+    return strstr(tag, "..") == NULL;
+}
+
+static int ensure_dirs_for_full_path(const char* full_path) {
+    if (!full_path || full_path[0] == '\0') {
+        return -1;
+    }
+
+    char temp[512];
+    strncpy(temp, full_path, sizeof(temp) - 1);
+    temp[sizeof(temp) - 1] = '\0';
+
+    for (char* p = temp + 1; *p; ++p) {
+        if (*p == '/') {
+            char saved = *p;
+            *p = '\0';
+            if (mkdir(temp, 0777) == -1 && errno != EEXIST) {
+                *p = saved;
+                return -1;
+            }
+            *p = saved;
+        }
+    }
+
+    return 0;
+}
+
+static int ensure_parent_dirs_for_relative(const char* relative_path) {
+    if (!relative_path) {
+        return -1;
+    }
+
+    char full_path[512];
+    snprintf(full_path, sizeof(full_path), "%s%s", SS_STORAGE_DIR, relative_path);
+    return ensure_dirs_for_full_path(full_path);
+}
+
+static void send_simple_response(int sock, const char* msg)
+{
+    if (!msg)
+    {
+        return;
+    }
+    send(sock, msg, strlen(msg), 0);
+}
+
+static int copy_file_contents(const char* src_path, const char* dst_path)
+{
+    FILE* src_fp = fopen(src_path, "r");
+    if (!src_fp)
+    {
+        return -1;
+    }
+
+    if (ensure_dirs_for_full_path(dst_path) != 0)
+    {
+        server_log("WARN", "Failed to prepare destination directories for %s", dst_path);
+    }
+
+    FILE* dst_fp = fopen(dst_path, "w");
+    if (!dst_fp)
+    {
+        fclose(src_fp);
+        return -1;
+    }
+
+    char buffer[4096];
+    size_t bytes_read, bytes_written;
+    int success = 0;
+
+    while ((bytes_read = fread(buffer, 1, sizeof(buffer), src_fp)) > 0)
+    {
+        bytes_written = fwrite(buffer, 1, bytes_read, dst_fp);
+        if (bytes_written != bytes_read)
+        {
+            success = -1;
+            break;
+        }
+    }
+
+    if (ferror(src_fp) || ferror(dst_fp))
+    {
+        success = -1;
+    }
+
+    fclose(src_fp);
+    fclose(dst_fp);
+
+    return success;
+}
+
+static void build_checkpoint_path(const char* filename, const char* tag, char* out, size_t out_size) {
+    if (!filename || !tag || !out || out_size == 0) {
+        if (out && out_size > 0) {
+            out[0] = '\0';
+        }
+        return;
+    }
+
+    snprintf(out, out_size, "%s.checkpoints/%s/%s", SS_STORAGE_DIR, filename, tag);
+}
+
+static void build_checkpoint_dir(const char* filename, char* out, size_t out_size) {
+    if (!filename || !out || out_size == 0) {
+        if (out && out_size > 0) {
+            out[0] = '\0';
+        }
+        return;
+    }
+    snprintf(out, out_size, "%s.checkpoints/%s", SS_STORAGE_DIR, filename);
 }
 
 int create_undo_backup(const char* file_path, const char* undo_path){
@@ -683,6 +862,10 @@ int create_undo_backup(const char* file_path, const char* undo_path){
         LOG_ERROR("Failed to get file stats for undo: %s", strerror(errno));
         close(source_fd);
         return -1;
+    }
+
+    if (ensure_dirs_for_full_path(undo_path) != 0) {
+        LOG_WARN("Failed to prepare directories for undo path: %s", undo_path);
     }
 
     int dest_fd = open(undo_path, O_WRONLY | O_CREAT | O_TRUNC, 0666);
@@ -823,32 +1006,60 @@ void* handle_nm_connection(void* args){
         LOG_INFO("Received NM command: %s", buffer);
 
         char* command;
-        char* filename;
+        char* arg1;
+        char* arg2;
         
         char buffer_copy[1024];
         strncpy(buffer_copy, buffer, sizeof(buffer_copy));
 
         command = strtok(buffer_copy, "|");
-        filename = strtok(NULL, "|");
+        arg1 = strtok(NULL, "|");
+        arg2 = strtok(NULL, "|");
 
-        if (!command || !filename) {
+        if (!command) {
 
             LOG_WARN("Invalid command format from NM: %s", buffer);
             send(conn_args->client_sock, "ACK_ERROR Invalid format\n", 24, 0);
             continue; 
         }
 
-        if (!is_filename_valid(filename)) {
-            LOG_WARN("SECURITY: Invalid filename received: %s", filename);
+        if ((strcmp(command, "CREATE") == 0 ||
+             strcmp(command, "DELETE") == 0 ||
+             strcmp(command, "CREATEFOLDER") == 0) && !arg1) {
+            LOG_WARN("Invalid command format from NM: %s", buffer);
+            send(conn_args->client_sock, "ACK_ERROR Invalid format\n", 24, 0);
+            continue;
+        }
+
+        if (strcmp(command, "MOVE") == 0 && (!arg1 || !arg2)) {
+            LOG_WARN("Invalid MOVE command format from NM: %s", buffer);
+            send(conn_args->client_sock, "ACK_ERROR Invalid format\n", 24, 0);
+            continue;
+        }
+
+        if ((strcmp(command, "CREATE") == 0 ||
+             strcmp(command, "DELETE") == 0 ||
+             strcmp(command, "CREATEFOLDER") == 0 ||
+             strcmp(command, "MOVE") == 0) && arg1 && !is_filename_valid(arg1)) {
+            LOG_WARN("SECURITY: Invalid filename received: %s", arg1);
             send(conn_args->client_sock, "ACK_ERROR Invalid filename\n", 26, 0);
             continue;
         }
 
-        char file_path[512];
-        snprintf(file_path, sizeof(file_path), "%s%s", SS_STORAGE_DIR, filename);
+        if (strcmp(command, "MOVE") == 0 && arg2 && !is_filename_valid(arg2)) {
+            LOG_WARN("SECURITY: Invalid MOVE target received: %s", arg2);
+            send(conn_args->client_sock, "ACK_ERROR Invalid filename\n", 26, 0);
+            continue;
+        }
+
+        char file_path[512] = {0};
+        if (arg1) {
+            snprintf(file_path, sizeof(file_path), "%s%s", SS_STORAGE_DIR, arg1);
+        }
 
         if (strcmp(command, "CREATE") == 0) {
 
+            ensure_parent_dirs_for_relative(arg1);
             FILE* fp = fopen(file_path, "w"); 
             if (fp) {
 
@@ -874,6 +1085,226 @@ void* handle_nm_connection(void* args){
                 LOG_ERROR("Failed to delete file: %s (%s)", file_path, strerror(errno));
                 send(conn_args->client_sock, "ACK_DELETE ERROR\n", 16, 0); 
             }
+        }
+        
+        else if (strcmp(command, "CREATEFOLDER") == 0) {
+
+            ensure_parent_dirs_for_relative(arg1);
+            char dir_path[512];
+            snprintf(dir_path, sizeof(dir_path), "%s%s", SS_STORAGE_DIR, arg1);
+            if (ensure_dirs_for_full_path(dir_path) != 0) {
+                LOG_WARN("Failed to ensure directories for folder: %s", dir_path);
+            }
+            if (mkdir(dir_path, 0777) == -1 && errno != EEXIST) {
+                LOG_ERROR("Failed to create folder %s (%s)", dir_path, strerror(errno));
+                send_simple_response(conn_args->client_sock, "ACK_CREATEFOLDER ERROR\n");
+            } else {
+                LOG_INFO("Folder created: %s", dir_path);
+                send_simple_response(conn_args->client_sock, "ACK_CREATEFOLDER OK\n");
+            }
+        }
+
+        else if (strcmp(command, "MOVE") == 0) {
+
+            char new_path[512];
+            snprintf(new_path, sizeof(new_path), "%s%s", SS_STORAGE_DIR, arg2);
+            if (ensure_dirs_for_full_path(new_path) != 0) {
+                LOG_WARN("Failed to prepare directories for %s", new_path);
+            }
+
+            if (rename(file_path, new_path) == 0) {
+                char old_undo[512];
+                char new_undo[512];
+                snprintf(old_undo, sizeof(old_undo), "%s%s.undo", SS_STORAGE_DIR, arg1);
+                snprintf(new_undo, sizeof(new_undo), "%s%s.undo", SS_STORAGE_DIR, arg2);
+                ensure_dirs_for_full_path(new_undo);
+                if (access(old_undo, F_OK) == 0) {
+                    rename(old_undo, new_undo);
+                }
+                LOG_INFO("File moved %s -> %s", file_path, new_path);
+                send_simple_response(conn_args->client_sock, "ACK_MOVE OK\n");
+            } else {
+                LOG_ERROR("Failed to move file %s -> %s (%s)", file_path, new_path, strerror(errno));
+                send_simple_response(conn_args->client_sock, "ACK_MOVE ERROR\n");
+            }
+        }
+
+        else if (strcmp(command, "CHECKPOINT") == 0) {
+
+            if (!arg2 || !is_tag_valid(arg2)) {
+                send_simple_response(conn_args->client_sock, "ACK_CHECKPOINT ERROR InvalidTag\n");
+                continue;
+            }
+
+            if (access(file_path, F_OK) != 0) {
+                send_simple_response(conn_args->client_sock, "ACK_CHECKPOINT ERROR NoFile\n");
+                continue;
+            }
+
+            char checkpoint_path[512];
+            build_checkpoint_path(arg1, arg2, checkpoint_path, sizeof(checkpoint_path));
+            if (copy_file_contents(file_path, checkpoint_path) == 0) {
+                LOG_INFO("Checkpoint %s created at %s", arg2, checkpoint_path);
+                send_simple_response(conn_args->client_sock, "ACK_CHECKPOINT OK\n");
+            } else {
+                LOG_ERROR("Failed to create checkpoint %s for %s", arg2, file_path);
+                send_simple_response(conn_args->client_sock, "ACK_CHECKPOINT ERROR\n");
+            }
+        }
+
+        else if (strcmp(command, "VIEWCHECKPOINT") == 0) {
+
+            if (!arg2 || !is_tag_valid(arg2)) {
+                send_simple_response(conn_args->client_sock, "ACK_VIEWCHECKPOINT ERROR InvalidTag\n");
+                continue;
+            }
+            char checkpoint_path[512];
+            build_checkpoint_path(arg1, arg2, checkpoint_path, sizeof(checkpoint_path));
+            FILE* fp = fopen(checkpoint_path, "r");
+            if (!fp) {
+                send_simple_response(conn_args->client_sock, "ACK_VIEWCHECKPOINT ERROR NotFound\n");
+                continue;
+            }
+            send_simple_response(conn_args->client_sock, "ACK_VIEWCHECKPOINT OK\n");
+            char chunk[512];
+            size_t nread;
+            while ((nread = fread(chunk, 1, sizeof(chunk), fp)) > 0) {
+                if (send(conn_args->client_sock, chunk, nread, 0) < 0) {
+                    break;
+                }
+            }
+            fclose(fp);
+            send(conn_args->client_sock, STOP_PACKET, strlen(STOP_PACKET), 0);
+        }
+
+        else if (strcmp(command, "REVERT") == 0) {
+
+            if (!arg2 || !is_tag_valid(arg2)) {
+                send_simple_response(conn_args->client_sock, "ACK_REVERT ERROR InvalidTag\n");
+                continue;
+            }
+
+            char checkpoint_path[512];
+            build_checkpoint_path(arg1, arg2, checkpoint_path, sizeof(checkpoint_path));
+            if (access(checkpoint_path, F_OK) != 0) {
+                send_simple_response(conn_args->client_sock, "ACK_REVERT ERROR NotFound\n");
+                continue;
+            }
+
+            if (copy_file_contents(checkpoint_path, file_path) == 0) {
+                LOG_INFO("Reverted %s to checkpoint %s", file_path, arg2);
+                send_simple_response(conn_args->client_sock, "ACK_REVERT OK\n");
+            } else {
+                LOG_ERROR("Failed to revert %s to checkpoint %s", file_path, arg2);
+                send_simple_response(conn_args->client_sock, "ACK_REVERT ERROR\n");
+            }
+        }
+
+        else if (strcmp(command, "LISTCHECKPOINTS") == 0) {
+
+            char checkpoint_dir[512];
+            build_checkpoint_dir(arg1, checkpoint_dir, sizeof(checkpoint_dir));
+            DIR* dir = opendir(checkpoint_dir);
+            char response[NM_RESP_BUFFER];
+            size_t used = 0;
+            if (!dir) {
+                used = snprintf(response, sizeof(response), "ACK_LISTCHECKPOINTS OK \n");
+            }
+            else {
+                used = snprintf(response, sizeof(response), "ACK_LISTCHECKPOINTS OK ");
+                struct dirent* entry;
+                int first = 1;
+                while ((entry = readdir(dir)) != NULL) {
+                    if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0) {
+                        continue;
+                    }
+                    if (!first) {
+                        used += snprintf(response + used, sizeof(response) - used, ",");
+                    }
+                    first = 0;
+                    used += snprintf(response + used, sizeof(response) - used, "%s", entry->d_name);
+                    if (used >= sizeof(response) - 2) {
+                        break;
+                    }
+                }
+                closedir(dir);
+                used += snprintf(response + used, sizeof(response) - used, "\n");
+            }
+            response[sizeof(response) - 1] = '\0';
+            send_simple_response(conn_args->client_sock, response);
+        }
+        
+        else if (strcmp(command, "SYNC") == 0) {
+            if (!arg1 || !arg2) {
+                LOG_WARN("Invalid SYNC command format");
+                send(conn_args->client_sock, "ACK_SYNC ERROR Invalid format\n", 30, 0);
+                continue;
+            }
+
+            char *src_ip = arg1;
+            int src_port = atoi(arg2);
+            char *filename = strtok(NULL, "|");
+            
+            if (!filename) {
+                LOG_WARN("Invalid SYNC command: missing filename");
+                send(conn_args->client_sock, "ACK_SYNC ERROR Missing filename\n", 32, 0);
+                continue;
+            }
+
+            LOG_INFO("SYNC request: copying %s from %s:%d", filename, src_ip, src_port);
+
+            int src_sock = socket(AF_INET, SOCK_STREAM, 0);
+            if (src_sock < 0) {
+                LOG_ERROR("Failed to create socket for SYNC");
+                send(conn_args->client_sock, "ACK_SYNC ERROR Socket failed\n", 29, 0);
+                continue;
+            }
+
+            struct sockaddr_in src_addr;
+            src_addr.sin_family = AF_INET;
+            src_addr.sin_port = htons(src_port);
+            src_addr.sin_addr.s_addr = inet_addr(src_ip);
+
+            if (connect(src_sock, (struct sockaddr *)&src_addr, sizeof(src_addr)) < 0) {
+                LOG_ERROR("Failed to connect to source SS for SYNC");
+                close(src_sock);
+                send(conn_args->client_sock, "ACK_SYNC ERROR Connection failed\n", 33, 0);
+                continue;
+            }
+
+            char read_cmd[512];
+            snprintf(read_cmd, sizeof(read_cmd), "READ|%s\n", filename);
+            send(src_sock, read_cmd, strlen(read_cmd), 0);
+
+            ensure_parent_dirs_for_relative(filename);
+            snprintf(file_path, sizeof(file_path), "%s%s", SS_STORAGE_DIR, filename);
+            FILE *fp = fopen(file_path, "w");
+            if (!fp) {
+                LOG_ERROR("Failed to open file for writing during SYNC: %s", file_path);
+                close(src_sock);
+                send(conn_args->client_sock, "ACK_SYNC ERROR Write failed\n", 28, 0);
+                continue;
+            }
+
+            char recv_buf[4096];
+            while (1) {
+                ssize_t n = recv(src_sock, recv_buf, sizeof(recv_buf) - 1, 0);
+                if (n <= 0) break;
+
+                recv_buf[n] = '\0';
+                char *stop_pos = strstr(recv_buf, "--STOP--");
+                if (stop_pos) *stop_pos = '\0';
+
+                fwrite(recv_buf, 1, strlen(recv_buf), fp);
+
+                if (stop_pos) break;
+            }
+
+            fclose(fp);
+            close(src_sock);
+
+            LOG_INFO("SYNC completed successfully for %s", filename);
+            send(conn_args->client_sock, "ACK_SYNC OK\n", 12, 0);
         }
         
         else {
@@ -1392,6 +1823,12 @@ void* start_server_listener(void* args){
         if (client_sock_fd < 0) {
             LOG_WARN("Failed to accept connection: %s", strerror(errno));
             continue; 
+        }
+
+        // Disable Nagle's algorithm for immediate word-by-word streaming
+        int flag = 1;
+        if (setsockopt(client_sock_fd, IPPROTO_TCP, TCP_NODELAY, (char *)&flag, sizeof(int)) < 0) {
+            LOG_WARN("Failed to set TCP_NODELAY: %s", strerror(errno));
         }
 
         connection_args_t* conn_args = malloc(sizeof(connection_args_t));

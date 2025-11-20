@@ -3,6 +3,53 @@
 #define NM_IP "127.0.0.1"
 #define NM_PORT 8000
 
+#include <errno.h>
+
+typedef struct
+{
+    char ip[INET_ADDRSTRLEN];
+    int port;
+    int valid;
+} SsEndpoint;
+
+static int connect_to_endpoint(const SsEndpoint *ep)
+{
+    if (!ep || !ep->valid)
+    {
+        return -1;
+    }
+    int sock = socket(AF_INET, SOCK_STREAM, 0);
+    if (sock < 0)
+    {
+        return -1;
+    }
+    struct sockaddr_in addr;
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons(ep->port);
+    addr.sin_addr.s_addr = inet_addr(ep->ip);
+    if (connect(sock, (struct sockaddr *)&addr, sizeof(addr)) < 0)
+    {
+        close(sock);
+        return -1;
+    }
+    return sock;
+}
+
+static int send_all(int sock, const char *buf, size_t len)
+{
+    size_t sent = 0;
+    while (sent < len)
+    {
+        ssize_t n = send(sock, buf + sent, len - sent, 0);
+        if (n <= 0)
+        {
+            return -1;
+        }
+        sent += (size_t)n;
+    }
+    return 0;
+}
+
 int main() 
 {
     printf("==========================================\n");
@@ -79,59 +126,129 @@ int main()
         // Exit command
         if (strcasecmp(command, "EXIT") == 0 || strcasecmp(command, "QUIT") == 0) 
         {
-            send(nm_sock, command, strlen(command), 0);
+            char exit_cmd[MAX_COMMAND + 2];
+            snprintf(exit_cmd, sizeof(exit_cmd), "%s\n", command);
+            send(nm_sock, exit_cmd, strlen(exit_cmd), 0);
             break;
         }
         
-        // Send command to Name Server
-        send(nm_sock, command, strlen(command), 0);
+        // Send command to Name Server (with newline)
+        char cmd_with_newline[MAX_COMMAND + 2];
+        snprintf(cmd_with_newline, sizeof(cmd_with_newline), "%s\n", command);
+        send(nm_sock, cmd_with_newline, strlen(cmd_with_newline), 0);
         
-        // Get response
-        bytes = recv(nm_sock, buffer, sizeof(buffer) - 1, 0);
-        if (bytes <= 0) 
+        char full_response[BUFFER_SIZE * 4];
+        full_response[0] = '\0';
+        size_t total_received = 0;
+        
+        while (1)
         {
-            printf("ERROR: Lost connection to Name Server\n");
-            break;
+            bytes = recv(nm_sock, buffer, sizeof(buffer) - 1, 0);
+            if (bytes <= 0) 
+            {
+                printf("ERROR: Lost connection to Name Server\n");
+                break;
+            }
+            
+            buffer[bytes] = '\0';
+            
+            if (total_received + bytes < sizeof(full_response) - 1)
+            {
+                memcpy(full_response + total_received, buffer, bytes);
+                total_received += bytes;
+                full_response[total_received] = '\0';
+            }
+            
+            if (strncmp(full_response, "CONNECT_SS", 10) == 0 || strstr(full_response, "\n--STOP--\n") != NULL)
+            {
+                break;
+            }
+            
+            usleep(10000);
+            
+            char peek;
+            ssize_t peek_result = recv(nm_sock, &peek, 1, MSG_PEEK | MSG_DONTWAIT);
+            if (peek_result <= 0)
+            {
+                break;
+            }
         }
         
-        buffer[bytes] = '\0';
+    // Strip STOP marker if present
+    char *stop_pos = strstr(full_response, "\n--STOP--\n");
+    if (stop_pos) *stop_pos = '\0';
+
+    strncpy(buffer, full_response, sizeof(buffer) - 1);
+    buffer[sizeof(buffer) - 1] = '\0';
 
         if (strncmp(buffer, "CONNECT_SS", 10) == 0) 
         {
             int is_undo = (strncmp(buffer, "CONNECT_SS_UNDO", 15) == 0);
-            char ss_ip[INET_ADDRSTRLEN];
-            int ss_port;
+            SsEndpoint primary = {.valid = 0};
+            SsEndpoint replica = {.valid = 0};
             char ss_filename[MAX_FILENAME];
 
-            // Parse CONNECT_SS packet
             char *token = strtok(buffer, " \n");
-            token = strtok(NULL, " ");      // IP
-            if (token) strncpy(ss_ip, token, sizeof(ss_ip));
-            token = strtok(NULL, " ");      // Port
-            if (token) ss_port = atoi(token);
+            token = strtok(NULL, " \n");      // IP
+            if (token)
+            {
+                strncpy(primary.ip, token, sizeof(primary.ip));
+                primary.valid = 1;
+            }
+            token = strtok(NULL, " \n");      // Port
+            if (token) primary.port = atoi(token);
             token = strtok(NULL, " \n");    // Filename
             if (token) strncpy(ss_filename, token, sizeof(ss_filename));
-            
-            printf("Connecting to Storage Server at %s:%d...\n", ss_ip, ss_port);
-
-            // Connect to Storage Server
-            int ss_sock = socket(AF_INET, SOCK_STREAM, 0);
-            if (ss_sock < 0) 
+            token = strtok(NULL, " \n");
+            if (token && strcmp(token, "REPLICA") == 0)
             {
-                perror("Failed to create SS socket");
+                char *rep_ip = strtok(NULL, " \n");
+                char *rep_port = strtok(NULL, " \n");
+                if (rep_ip && rep_port)
+                {
+                    strncpy(replica.ip, rep_ip, sizeof(replica.ip));
+                    replica.port = atoi(rep_port);
+                    replica.valid = 1;
+                }
+            }
+
+            if (!primary.valid)
+            {
+                printf("ERROR: Invalid storage server info\n");
                 continue;
             }
             
-            struct sockaddr_in ss_addr;
-            ss_addr.sin_family = AF_INET;
-            ss_addr.sin_port = htons(ss_port);
-            ss_addr.sin_addr.s_addr = inet_addr(ss_ip);
-            
-            if (connect(ss_sock, (struct sockaddr *)&ss_addr, sizeof(ss_addr)) < 0) 
+            printf("Connecting to Storage Server at %s:%d...\n", primary.ip, primary.port);
+
+            int ss_sock = connect_to_endpoint(&primary);
+            if (ss_sock < 0) 
+            {
+                if (replica.valid)
+                {
+                    printf("Primary unavailable, trying replica %s:%d...\n",
+                           replica.ip, replica.port);
+                    ss_sock = connect_to_endpoint(&replica);
+                    if (ss_sock >= 0)
+                    {
+                        primary = replica;
+                    }
+                }
+            }
+            if (ss_sock < 0)
             {
                 perror("Failed to connect to Storage Server");
-                close(ss_sock);
                 continue;
+            }
+
+            int replica_sock = -1;
+            if (replica.valid &&
+                (strcmp(replica.ip, primary.ip) != 0 || replica.port != primary.port))
+            {
+                replica_sock = connect_to_endpoint(&replica);
+                if (replica_sock < 0)
+                {
+                    replica.valid = 0;
+                }
             }
 
             char cmd_copy[MAX_COMMAND];
@@ -142,7 +259,7 @@ int main()
             {
                 char ss_cmd[512];
                 snprintf(ss_cmd, sizeof(ss_cmd), "READ|%s\n", ss_filename);
-                send(ss_sock, ss_cmd, strlen(ss_cmd), 0);
+                send_all(ss_sock, ss_cmd, strlen(ss_cmd));
                 
                 printf("\n");
                 char recv_buf[BUFFER_SIZE];
@@ -171,7 +288,7 @@ int main()
             {
                 char ss_cmd[512];
                 snprintf(ss_cmd, sizeof(ss_cmd), "STREAM|%s\n", ss_filename);
-                send(ss_sock, ss_cmd, strlen(ss_cmd), 0);
+                send_all(ss_sock, ss_cmd, strlen(ss_cmd));
 
                 char recv_buf[BUFFER_SIZE];
                 char partial[BUFFER_SIZE];
@@ -234,7 +351,11 @@ int main()
             {
                 char ss_cmd[512];
                 snprintf(ss_cmd, sizeof(ss_cmd), "UNDO|%s\n", ss_filename);
-                send(ss_sock, ss_cmd, strlen(ss_cmd), 0);
+                send_all(ss_sock, ss_cmd, strlen(ss_cmd));
+                if (replica_sock >= 0)
+                {
+                    send_all(replica_sock, ss_cmd, strlen(ss_cmd));
+                }
                 
                 char undo_resp[256];
                 ssize_t n = recv(ss_sock, undo_resp, sizeof(undo_resp) - 1, 0);
@@ -243,10 +364,16 @@ int main()
                     undo_resp[n] = '\0';
                     printf("%s\n", undo_resp);
                 }
+                if (replica_sock >= 0)
+                {
+                    char replica_resp[256];
+                    recv(replica_sock, replica_resp, sizeof(replica_resp) - 1, 0);
+                }
             }
 
             else if (strcasecmp(cmd_token, "WRITE") == 0) 
             {
+                int write_replica_sock = replica_sock;
                 char write_cmd_copy[MAX_COMMAND];
                 strncpy(write_cmd_copy, command, sizeof(write_cmd_copy));
                 write_cmd_copy[sizeof(write_cmd_copy) - 1] = '\0';
@@ -261,7 +388,22 @@ int main()
 
                 char ss_cmd[512];
                 snprintf(ss_cmd, sizeof(ss_cmd), "WRITE|%s|%d\n", ss_filename, sentence_num);
-                send(ss_sock, ss_cmd, strlen(ss_cmd), 0);
+                if (send_all(ss_sock, ss_cmd, strlen(ss_cmd)) != 0)
+                {
+                    printf("ERROR: Storage Server failed to accept WRITE\n");
+                    if (write_replica_sock >= 0) close(write_replica_sock);
+                    close(ss_sock);
+                    continue;
+                }
+                if (write_replica_sock >= 0)
+                {
+                    if (send_all(write_replica_sock, ss_cmd, strlen(ss_cmd)) != 0)
+                    {
+                        printf("WARN: Replica server failed to accept WRITE\n");
+                        close(write_replica_sock);
+                        write_replica_sock = -1;
+                    }
+                }
                 
                 // Wait for ACK_WRITE
                 char ack[256];
@@ -269,8 +411,20 @@ int main()
                 if (n <= 0 || strncmp(ack, "ACK_WRITE", 9) != 0) 
                 {
                     printf("ERROR: Storage Server failed to accept WRITE\n");
+                    if (write_replica_sock >= 0) close(write_replica_sock);
                     close(ss_sock);
                     continue;
+                }
+                if (write_replica_sock >= 0)
+                {
+                    char replica_ack[256];
+                    n = recv(write_replica_sock, replica_ack, sizeof(replica_ack) - 1, 0);
+                    if (n <= 0 || strncmp(replica_ack, "ACK_WRITE", 9) != 0)
+                    {
+                        printf("WARN: Replica server failed to accept WRITE\n");
+                        close(write_replica_sock);
+                        write_replica_sock = -1;
+                    }
                 }
 
                 // Write mode loop
@@ -285,7 +439,11 @@ int main()
                     
                     if (strcasecmp(write_input, "ETIRW") == 0) 
                     {
-                        send(ss_sock, "ETIRW\n", 6, 0);
+                        send_all(ss_sock, "ETIRW\n", 6);
+                        if (write_replica_sock >= 0)
+                        {
+                            send_all(write_replica_sock, "ETIRW\n", 6);
+                        }
                         
                         char etirw_resp[256];
                         n = recv(ss_sock, etirw_resp, sizeof(etirw_resp) - 1, 0);
@@ -293,6 +451,10 @@ int main()
                         {
                             etirw_resp[n] = '\0';
                             printf("%s\n", etirw_resp);
+                        }
+                        if (write_replica_sock >= 0)
+                        {
+                            recv(write_replica_sock, etirw_resp, sizeof(etirw_resp) - 1, 0);
                         }
                         break;
                     }
@@ -304,7 +466,20 @@ int main()
                     {
                         char write_cmd[1024];
                         snprintf(write_cmd, sizeof(write_cmd), "%d|%s\n", word_idx, content);
-                        send(ss_sock, write_cmd, strlen(write_cmd), 0);
+                        if (send_all(ss_sock, write_cmd, strlen(write_cmd)) != 0)
+                        {
+                            printf("ERROR: Failed to send write command\n");
+                            break;
+                        }
+                        if (write_replica_sock >= 0)
+                        {
+                            if (send_all(write_replica_sock, write_cmd, strlen(write_cmd)) != 0)
+                            {
+                                printf("WARN: Failed to send write command to replica\n");
+                                close(write_replica_sock);
+                                write_replica_sock = -1;
+                            }
+                        }
                         
                         char write_resp[256];
                         n = recv(ss_sock, write_resp, sizeof(write_resp) - 1, 0);
@@ -314,12 +489,26 @@ int main()
                             write_resp[n] = '\0';
                             printf("%s", write_resp);
                         }
+                        if (write_replica_sock >= 0)
+                        {
+                            recv(write_replica_sock, write_resp, sizeof(write_resp) - 1, 0);
+                        }
                     } 
                     else 
                     {
                         printf("Invalid format. Use: <word_index> <content>\n");
                     }
                 }
+                if (write_replica_sock >= 0)
+                {
+                    close(write_replica_sock);
+                }
+                replica_sock = -1;
+            }
+            
+            if (replica_sock >= 0)
+            {
+                close(replica_sock);
             }
             
             close(ss_sock);

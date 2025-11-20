@@ -2,6 +2,7 @@
 #include "nm_metadata.h"
 #include "commands.h"
 #include <sys/stat.h>
+#include <netinet/tcp.h>
 
 #define NM_PORT 8000
 
@@ -60,6 +61,13 @@ int main()
         {
             perror("Accept failed");
             continue;
+        }
+
+        // Disable Nagle for interactive client responses
+        int flag = 1;
+        if (setsockopt(client_sock, IPPROTO_TCP, TCP_NODELAY, (char *)&flag, sizeof(flag)) < 0)
+        {
+            perror("Failed to set TCP_NODELAY");
         }
 
         char client_ip[INET_ADDRSTRLEN];
@@ -129,8 +137,48 @@ void *handle_client_thread(void *arg)
         token = strtok_r(NULL, "|", &saveptr);
         char *file_list = token ? token : "";
 
-        // Register Storage Server
+        // Register Storage Server (handles both new registration and re-registration)
         int ss_index = register_storage_server(client_sock, ss_ip, nm_port, client_port);
+        int is_reregistration = (ss_index & 0x10000) != 0;
+        ss_index = ss_index & 0xFFFF;
+
+        if (ss_index >= 0 && is_reregistration)
+        {
+            StorageServerInfo *reregistered_ss = &nm_state.storage_servers[ss_index];
+            FileMetadata **all_files;
+            int file_count = get_all_files(&nm_state.file_map, &all_files);
+            
+            for (int i = 0; i < file_count; i++)
+            {
+                FileMetadata *file = all_files[i];
+                
+                if (file->ss_index == ss_index)
+                {
+                    if (file->replica_ss_index >= 0)
+                    {
+                        StorageServerInfo *replica = &nm_state.storage_servers[file->replica_ss_index];
+                        if (replica->active)
+                        {
+                            printf("[NM] File %s: Primary (SS%d) was dead, syncing from Replica (SS%d), then swapping roles\n",
+                                   file->filename, ss_index, file->replica_ss_index);
+                            log_message("INFO", ss_ip, nm_port, "SYSTEM", 
+                                       "Synchronizing file from replica to reregistered primary");
+                            
+                            synchronize_file_between_ss(file->filename, replica, reregistered_ss);
+                            
+                            int temp = file->ss_index;
+                            file->ss_index = file->replica_ss_index;
+                            file->replica_ss_index = temp;
+                        }
+                    }
+                }
+            }
+            
+            if (file_count > 0)
+            {
+                free(all_files);
+            }
+        }
 
         // add files from SS to NM metadata
         if (ss_index >= 0 && strlen(file_list) > 0)
@@ -237,18 +285,51 @@ void *handle_client_thread(void *arg)
         }
 
         buffer[bytes] = '\0';
-        trim_string(buffer);
-
-        if (strcasecmp(buffer, "EXIT") == 0 || strcasecmp(buffer, "QUIT") == 0)
+        
+        // Split buffer by newlines and process each command separately
+        char *line = buffer;
+        char *next_line;
+        while (line && *line)
         {
-            send(client_sock, "Goodbye!\n", 9, 0);
-            break;
+            // Find the next newline
+            next_line = strchr(line, '\n');
+            if (next_line)
+            {
+                *next_line = '\0';
+                next_line++;
+            }
+            
+            // Trim current line
+            char *cmd_start = line;
+            while (*cmd_start == ' ' || *cmd_start == '\t' || *cmd_start == '\r')
+                cmd_start++;
+            
+            char *cmd_end = cmd_start + strlen(cmd_start) - 1;
+            while (cmd_end >= cmd_start && (*cmd_end == ' ' || *cmd_end == '\t' || *cmd_end == '\r'))
+                cmd_end--;
+            cmd_end[1] = '\0';
+            
+            if (*cmd_start == '\0')
+            {
+                line = next_line;
+                continue;
+            }
+            
+            if (strcasecmp(cmd_start, "EXIT") == 0 || strcasecmp(cmd_start, "QUIT") == 0)
+            {
+                send(client_sock, "Goodbye!\n", 9, 0);
+                goto client_exit;
+            }
+
+            printf("[NM] %s: %s\n", username, cmd_start);
+
+            handle_command(client_sock, username, cmd_start);
+            
+            line = next_line;
         }
-
-        printf("[NM] %s: %s\n", username, buffer);
-
-        handle_command(client_sock, username, buffer);
     }
+    
+client_exit:
 
     // Client exits
     printf("[NM] Client %s disconnected\n", username);
