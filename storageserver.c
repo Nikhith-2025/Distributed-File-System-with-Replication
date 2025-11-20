@@ -4,6 +4,7 @@
 #include <unistd.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
+#include <netinet/tcp.h>
 #include <arpa/inet.h>
 #include <pthread.h>
 #include <sys/stat.h>
@@ -1233,6 +1234,79 @@ void* handle_nm_connection(void* args){
             send_simple_response(conn_args->client_sock, response);
         }
         
+        else if (strcmp(command, "SYNC") == 0) {
+            if (!arg1 || !arg2) {
+                LOG_WARN("Invalid SYNC command format");
+                send(conn_args->client_sock, "ACK_SYNC ERROR Invalid format\n", 30, 0);
+                continue;
+            }
+
+            char *src_ip = arg1;
+            int src_port = atoi(arg2);
+            char *filename = strtok(NULL, "|");
+            
+            if (!filename) {
+                LOG_WARN("Invalid SYNC command: missing filename");
+                send(conn_args->client_sock, "ACK_SYNC ERROR Missing filename\n", 32, 0);
+                continue;
+            }
+
+            LOG_INFO("SYNC request: copying %s from %s:%d", filename, src_ip, src_port);
+
+            int src_sock = socket(AF_INET, SOCK_STREAM, 0);
+            if (src_sock < 0) {
+                LOG_ERROR("Failed to create socket for SYNC");
+                send(conn_args->client_sock, "ACK_SYNC ERROR Socket failed\n", 29, 0);
+                continue;
+            }
+
+            struct sockaddr_in src_addr;
+            src_addr.sin_family = AF_INET;
+            src_addr.sin_port = htons(src_port);
+            src_addr.sin_addr.s_addr = inet_addr(src_ip);
+
+            if (connect(src_sock, (struct sockaddr *)&src_addr, sizeof(src_addr)) < 0) {
+                LOG_ERROR("Failed to connect to source SS for SYNC");
+                close(src_sock);
+                send(conn_args->client_sock, "ACK_SYNC ERROR Connection failed\n", 33, 0);
+                continue;
+            }
+
+            char read_cmd[512];
+            snprintf(read_cmd, sizeof(read_cmd), "READ|%s\n", filename);
+            send(src_sock, read_cmd, strlen(read_cmd), 0);
+
+            ensure_parent_dirs_for_relative(filename);
+            snprintf(file_path, sizeof(file_path), "%s%s", SS_STORAGE_DIR, filename);
+            FILE *fp = fopen(file_path, "w");
+            if (!fp) {
+                LOG_ERROR("Failed to open file for writing during SYNC: %s", file_path);
+                close(src_sock);
+                send(conn_args->client_sock, "ACK_SYNC ERROR Write failed\n", 28, 0);
+                continue;
+            }
+
+            char recv_buf[4096];
+            while (1) {
+                ssize_t n = recv(src_sock, recv_buf, sizeof(recv_buf) - 1, 0);
+                if (n <= 0) break;
+
+                recv_buf[n] = '\0';
+                char *stop_pos = strstr(recv_buf, "--STOP--");
+                if (stop_pos) *stop_pos = '\0';
+
+                fwrite(recv_buf, 1, strlen(recv_buf), fp);
+
+                if (stop_pos) break;
+            }
+
+            fclose(fp);
+            close(src_sock);
+
+            LOG_INFO("SYNC completed successfully for %s", filename);
+            send(conn_args->client_sock, "ACK_SYNC OK\n", 12, 0);
+        }
+        
         else {
             LOG_WARN("Unknown command from NM: %s", command);
             send(conn_args->client_sock, "ACK_ERROR Unknown command\n", 25, 0);
@@ -1759,6 +1833,12 @@ void* start_server_listener(void* args){
         if (client_sock_fd < 0) {
             LOG_WARN("Failed to accept connection: %s", strerror(errno));
             continue; 
+        }
+
+        // Disable Nagle's algorithm for immediate word-by-word streaming
+        int flag = 1;
+        if (setsockopt(client_sock_fd, IPPROTO_TCP, TCP_NODELAY, (char *)&flag, sizeof(int)) < 0) {
+            LOG_WARN("Failed to set TCP_NODELAY: %s", strerror(errno));
         }
 
         connection_args_t* conn_args = malloc(sizeof(connection_args_t));

@@ -137,15 +137,49 @@ int main()
         snprintf(cmd_with_newline, sizeof(cmd_with_newline), "%s\n", command);
         send(nm_sock, cmd_with_newline, strlen(cmd_with_newline), 0);
         
-        // Get response
-        bytes = recv(nm_sock, buffer, sizeof(buffer) - 1, 0);
-        if (bytes <= 0) 
+        char full_response[BUFFER_SIZE * 4];
+        full_response[0] = '\0';
+        size_t total_received = 0;
+        
+        while (1)
         {
-            printf("ERROR: Lost connection to Name Server\n");
-            break;
+            bytes = recv(nm_sock, buffer, sizeof(buffer) - 1, 0);
+            if (bytes <= 0) 
+            {
+                printf("ERROR: Lost connection to Name Server\n");
+                break;
+            }
+            
+            buffer[bytes] = '\0';
+            
+            if (total_received + bytes < sizeof(full_response) - 1)
+            {
+                memcpy(full_response + total_received, buffer, bytes);
+                total_received += bytes;
+                full_response[total_received] = '\0';
+            }
+            
+            if (strncmp(full_response, "CONNECT_SS", 10) == 0 || strstr(full_response, "\n--STOP--\n") != NULL)
+            {
+                break;
+            }
+            
+            usleep(10000);
+            
+            char peek;
+            ssize_t peek_result = recv(nm_sock, &peek, 1, MSG_PEEK | MSG_DONTWAIT);
+            if (peek_result <= 0)
+            {
+                break;
+            }
         }
         
-        buffer[bytes] = '\0';
+    // Strip STOP marker if present
+    char *stop_pos = strstr(full_response, "\n--STOP--\n");
+    if (stop_pos) *stop_pos = '\0';
+
+    strncpy(buffer, full_response, sizeof(buffer) - 1);
+    buffer[sizeof(buffer) - 1] = '\0';
 
         if (strncmp(buffer, "CONNECT_SS", 10) == 0) 
         {

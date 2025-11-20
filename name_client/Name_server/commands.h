@@ -18,5 +18,6 @@ void cmd_view_folder(int client_sock, const char *username, const char *folder_p
 void cmd_move_file(int client_sock, const char *username, const char *file_path, const char *target_folder);
 void send_response(int sock, const char *message);
 void send_error(int sock, ErrorCode err);
+int synchronize_file_between_ss(const char *filename, StorageServerInfo *source_ss, StorageServerInfo *dest_ss);
 
 #endif

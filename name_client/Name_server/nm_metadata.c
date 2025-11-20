@@ -575,6 +575,23 @@ int register_storage_server(int sockfd, const char *ip, int nm_port, int client_
 
     pthread_mutex_lock(&nm_state.ss_lock);
 
+    for (int i = 0; i < nm_state.storage_count; i++)
+    {
+        StorageServerInfo *existing = &nm_state.storage_servers[i];
+        if (strcmp(existing->ip, ip) == 0 && 
+            existing->nm_port == nm_port && 
+            existing->client_port == client_port)
+        {
+            log_message("INFO", ip, nm_port, "SYSTEM", 
+                       "Storage server re-registered - will sync from replicas");
+            existing->active = 1;
+            existing->sockfd = -1;
+            
+            pthread_mutex_unlock(&nm_state.ss_lock);
+            return i | 0x10000;
+        }
+    }
+
     if (nm_state.storage_count >= MAX_STORAGE_SERVERS)
     {
         pthread_mutex_unlock(&nm_state.ss_lock);

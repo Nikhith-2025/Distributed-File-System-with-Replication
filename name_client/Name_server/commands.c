@@ -321,7 +321,13 @@ static int forward_until_stop(int src_sock, int dst_sock)
 // Send a normal response to the client
 void send_response(int sock, const char *message)
 {
-    send(sock, message, strlen(message), 0);
+    size_t len = strlen(message);
+    size_t sent = 0;
+    while (sent < len) {
+        ssize_t n = send(sock, message + sent, len - sent, 0);
+        if (n <= 0) break;
+        sent += (size_t)n;
+    }
 }
 
 // Send an error to the client
@@ -353,6 +359,8 @@ static int send_ss_command(StorageServerInfo *ss, const char *cmd, char *respons
         printf("[NM] Detected SS failure at %s:%d. Marking inactive.\n", ss->ip, ss->nm_port);
         ss->active = 0; 
         close(sock);
+        ss->active = 0;
+        log_message("ERROR", ss->ip, ss->nm_port, "SYSTEM", "Storage server connection failed - marked as inactive");
         return -1;
     }
 
@@ -360,6 +368,8 @@ static int send_ss_command(StorageServerInfo *ss, const char *cmd, char *respons
     {
         ss->active = 0;
         close(sock);
+        ss->active = 0;
+        log_message("ERROR", ss->ip, ss->nm_port, "SYSTEM", "Storage server send failed - marked as inactive");
         return -1;
     }
 
@@ -368,12 +378,54 @@ static int send_ss_command(StorageServerInfo *ss, const char *cmd, char *respons
     {   
         ss->active = 0;
         close(sock);
+        ss->active = 0;
+        log_message("ERROR", ss->ip, ss->nm_port, "SYSTEM", "Storage server recv failed - marked as inactive");
         return -1;
     }
 
     response[n] = '\0';
     close(sock);
     return 0;
+}
+
+int synchronize_file_between_ss(const char *filename, StorageServerInfo *source_ss, StorageServerInfo *dest_ss)
+{
+    if (!source_ss || !dest_ss || !source_ss->active || !dest_ss->active)
+    {
+        return -1;
+    }
+
+    int dest_sock = socket(AF_INET, SOCK_STREAM, 0);
+    if (dest_sock < 0)
+    {
+        return -1;
+    }
+
+    struct sockaddr_in dest_addr;
+    dest_addr.sin_family = AF_INET;
+    dest_addr.sin_port = htons(dest_ss->nm_port);
+    dest_addr.sin_addr.s_addr = inet_addr(dest_ss->ip);
+
+    if (connect(dest_sock, (struct sockaddr *)&dest_addr, sizeof(dest_addr)) < 0)
+    {
+        close(dest_sock);
+        return -1;
+    }
+
+    char sync_cmd[512];
+    snprintf(sync_cmd, sizeof(sync_cmd), "SYNC|%s|%d|%s\n", source_ss->ip, source_ss->client_port, filename);
+    send(dest_sock, sync_cmd, strlen(sync_cmd), 0);
+
+    char ack[256];
+    ssize_t n = recv(dest_sock, ack, sizeof(ack) - 1, 0);
+    close(dest_sock);
+
+    if (n > 0 && strstr(ack, "ACK_SYNC OK"))
+    {
+        return 0;
+    }
+
+    return -1;
 }
 
 static const char *access_level_to_string(AccessLevel level)
@@ -921,7 +973,6 @@ void handle_command(int client_sock, const char *username, const char *command)
         char *target_user = strtok(NULL, " \t\n");
         if (!filename || !target_user)
         {
-            send_error(client_sock, ERR_INVALID_ARGUMENTS);
             return;
         }
         char normalized_filename[MAX_FILENAME];
@@ -1065,7 +1116,6 @@ void handle_command(int client_sock, const char *username, const char *command)
         char *tag = strtok(NULL, " \t\n");
         if (!tag || !is_valid_checkpoint_tag(tag))
         {
-            send_error(client_sock, ERR_INVALID_ARGUMENTS);
             return;
         }
 
@@ -1401,31 +1451,80 @@ void handle_command(int client_sock, const char *username, const char *command)
             return;
         }
 
-        FILE *exec_pipe = popen(file_content, "r");
-        if (!exec_pipe)
+        // Split file content by sentence delimiters (. ! ?) and execute each sentence separately
+        int total_exit_status = 0;
+        int command_count = 0;
+        char current_sentence[BUFFER_SIZE * 4];
+        size_t sentence_len = 0;
+
+        for (size_t i = 0; i <= content_len; i++)
         {
-            send_response(client_sock, "ERROR: Execution failed\n");
-            return;
+            // Check for sentence delimiter or end of content
+            int is_delimiter = (file_content[i] == '.' || file_content[i] == '!' || file_content[i] == '?');
+            int is_end = (i == content_len);
+
+            if (!is_delimiter && !is_end)
+            {
+                // Accumulate characters in current sentence
+                if (sentence_len < sizeof(current_sentence) - 1)
+                {
+                    current_sentence[sentence_len++] = file_content[i];
+                }
+                continue;
+            }
+
+            if (sentence_len > 0)
+            {
+                current_sentence[sentence_len] = '\0';
+
+                // Trim whitespace and delimiters
+                char *cmd_start = current_sentence;
+                while (*cmd_start == ' ' || *cmd_start == '\t' || *cmd_start == '\r' || *cmd_start == '\n')
+                    cmd_start++;
+
+                char *cmd_end = cmd_start + strlen(cmd_start) - 1;
+                while (cmd_end >= cmd_start && 
+                       (*cmd_end == ' ' || *cmd_end == '\t' || *cmd_end == '\r' || *cmd_end == '\n' ||
+                        *cmd_end == '.' || *cmd_end == '!' || *cmd_end == '?'))
+                    cmd_end--;
+                cmd_end[1] = '\0';
+
+                if (*cmd_start != '\0')
+                {
+                    command_count++;
+
+                    FILE *exec_pipe = popen(cmd_start, "r");
+                    if (!exec_pipe)
+                    {
+                        total_exit_status = -1;
+                    }
+                    else
+                    {
+                        char exec_output[BUFFER_SIZE];
+                        while (fgets(exec_output, sizeof(exec_output), exec_pipe) != NULL)
+                        {
+                            send_response(client_sock, exec_output);
+                        }
+
+                        int exit_status = pclose(exec_pipe);
+                        if (exit_status != 0)
+                        {
+                            total_exit_status = exit_status;
+                        }
+                    }
+                }
+
+                sentence_len = 0;
+            }
         }
 
-        char exec_output[BUFFER_SIZE];
-        while (fgets(exec_output, sizeof(exec_output), exec_pipe) != NULL)
-        {
-            send_response(client_sock, exec_output);
-        }
-
-        int exit_status = pclose(exec_pipe);
-        if (exit_status == 0)
+        if (total_exit_status == 0)
         {
             log_response(username, ERR_SUCCESS, filename);
         }
-        else
-        {
-            char err_msg[128];
-            snprintf(err_msg, sizeof(err_msg),
-                     "\nExecution completed with exit code: %d\n", exit_status);
-            send_response(client_sock, err_msg);
-        }
+
+        // Signal end of multi-part response to client
+        send_response(client_sock, STOP_PACKET);
     }
 
     // ================= UNDO =================
