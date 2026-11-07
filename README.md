@@ -4,8 +4,8 @@ A networked file system in C, built with sockets and POSIX threads. Several user
 create, read and edit shared text files at the same time, and every file is copied to
 a second storage server so it survives a server going down.
 
-Team project for the Operating Systems and Networks course at IIIT Hyderabad
-(Monsoon 2025), built with Ayush Sabhasad.
+Built for the Operating Systems and Networks course at IIIT Hyderabad (Monsoon 2025).
+Ayush Sabhasad helped with the storage server.
 
 ## How it works
 
